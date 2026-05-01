@@ -1,0 +1,352 @@
+include:
+  - local: 'templates/iac-base.yml'
+  # - template: Jobs/SAST-IaC.gitlab-ci.yml
+  # # component path requires gitlab.com SaaS or a local mirror; use built-in template instead
+  # - component: $CI_SERVER_FQDN/components/sast/iac-sast@3.4.0
+  # - component: gitlab.com/components/sast/iac-sast@3.4.0
+  #   inputs:
+  #     stage: security-check
+  #     enable_mr_pipelines: true
+  #     # image_prefix: $CI_TEMPLATE_REGISTRY_HOST/security-products
+  #     image_prefix: registry.gitlab.com/security-products
+
+#kics-iac-sast:
+#  stage: syntax-check
+
+syntax-tflint:
+  stage: syntax-check
+  image:
+    name: ghcr.io/terraform-linters/tflint:v0.62.0@sha256:80979608a412232a918a0178765b98149bdc43181276cee6612ad1cf4cdf35e1
+    pull_policy: if-not-present
+    entrypoint:
+      - '/usr/bin/env'
+  cache:
+    - key: "tflint-plugins-v1"
+      paths:
+        - $HOME/.tflint.d/plugins
+      policy: pull-push
+  # before_script:
+  #  - apk update && apk add --no-cache python3 py3-pip
+  #  - pip install --no-cache-dir --break-system-packages sarif-tools
+  #  - sarif --version
+  script:
+    - |
+      set -euo pipefail
+      mkdir -p "${HOME}/.tflint.d/plugins"
+
+      if [ -n "${TFLINT_PLUGIN_GITHUB_TOKEN:-}" ] && [ -z "${GITHUB_TOKEN:-}" ]; then
+        export GITHUB_TOKEN="${TFLINT_PLUGIN_GITHUB_TOKEN}"
+      fi
+
+      tflint --version
+      echo "Using TFLint plugin cache dir: ${HOME}/.tflint.d/plugins"
+      tflint --init
+      tflint --format sarif --minimum-failure-severity=error --no-color | tee tflint-sarif.json
+      tflint --format junit --minimum-failure-severity=error --no-color | tee tflint-junit.json
+      echo ''
+      # sarif codeclimate tflint-sarif.json -o gl-code-quality-tflint.json
+      # echo "tflint-sarif.json conversion by 'sarif codeclimate' finished with exit code: $?"
+  artifacts:
+    when: always
+    reports:
+      junit: tflint-junit.json
+      # codequality: gl-code-quality-tflint.json
+    paths:
+      - "tflint-sarif.json"
+      - "tflint-junit.json"
+      # - gl-code-quality-tflint.json
+  allow_failure: false
+
+terragrunt-hcl-validate-use-prebuilt-container:
+  stage: syntax-check
+  image:
+    name: "${IAC_PIPELINE_IMAGE}"
+    pull_policy: if-not-present
+    entrypoint: [""]
+  script:
+    - |
+      set -euo pipefail
+      terragrunt --version
+      terragrunt info print || true
+      terragrunt hcl validate --all
+
+check-custom-kics:
+  stage: security-check
+  timeout: 8m
+  cache: []
+  image:
+    name: docker.io/checkmarx/kics:v2.1.20@sha256:3e5a268eb8adda2e5a483c9359ddfc4cd520ab856a7076dc0b1d8784a37e2602
+    pull_policy: if-not-present
+    entrypoint:
+      - '/usr/bin/env'
+  script:
+    - kics scan -p . -o "./" --report-formats glsast --output-name custom-kics --exclude-paths .terraform/*
+  artifacts:
+    when: always
+    reports:
+      sast: "gl-sast-custom-kics.json"
+    paths:
+      - "gl-sast-custom-kics.json"
+  allow_failure: false
+
+check-branch-freshness:
+  stage: syntax-check
+  image:
+    name: public.ecr.aws/docker/library/alpine:3.23.4@sha256:310c62b5e7ca5b08167e4384c68db0fd2905dd9c7493756d356e893909057601
+    pull_policy: if-not-present
+    entrypoint: [""]
+  variables:
+    GIT_DEPTH: 0
+    GIT_STRATEGY: fetch
+  before_script:
+    - |
+      set -eu
+
+      apk add --no-cache ca-certificates git openssl
+
+      normalize_cert() {
+        input_path="$1"
+        output_path="$2"
+
+        if openssl x509 -in "$input_path" -noout >/dev/null 2>&1; then
+          openssl x509 -in "$input_path" -out "$output_path" >/dev/null 2>&1 || cp -f "$input_path" "$output_path"
+          return 0
+        fi
+
+        if openssl x509 -inform DER -in "$input_path" -noout >/dev/null 2>&1; then
+          openssl x509 -inform DER -in "$input_path" -out "$output_path"
+          return 0
+        fi
+
+        echo "ERROR: '$input_path' is not a valid X.509 certificate (PEM or DER)." >&2
+        return 1
+      }
+
+      echo "Creating custom CA bundle for Git..."
+      normalize_cert "$LOCAL_INTERMEDIATE_CA_CERT_FILE" /tmp/local-intermediate.pem
+      normalize_cert "$LOCAL_ROOT_CA_CERT_FILE" /tmp/local-root.pem
+
+      echo "Local intermediate details:"
+      openssl x509 -in /tmp/local-intermediate.pem -noout -subject -issuer -fingerprint -sha256
+      echo "Local root details:"
+      openssl x509 -in /tmp/local-root.pem -noout -subject -issuer -fingerprint -sha256
+
+      cat /etc/ssl/certs/ca-certificates.crt /tmp/local-intermediate.pem /tmp/local-root.pem > /tmp/custom-bundle.crt
+
+      export GIT_SSL_CAINFO=/tmp/custom-bundle.crt
+      export SSL_CERT_FILE=/tmp/custom-bundle.crt
+      export CURL_CA_BUNDLE=/tmp/custom-bundle.crt
+      git config --global http.sslCAInfo /tmp/custom-bundle.crt
+      git config --global --add safe.directory "${CI_PROJECT_DIR}"
+
+      host="${CI_SERVER_HOST}"
+      if [ -z "${host}" ]; then
+        echo "NOTE: CI_SERVER_HOST is empty; skipping TLS sanity check."
+      else
+      echo "Sanity-checking TLS chain against ${host}..."
+      rm -f /tmp/server-*.pem /tmp/server-chain.pem
+
+      openssl s_client -connect "${host}:443" -servername "${host}" -showcerts </dev/null 2>/tmp/s_client.log \
+        | awk 'BEGIN{c=0} /BEGIN CERTIFICATE/{c++} {if (c>0) print > ("/tmp/server-"c".pem")}'
+
+      if [ -f /tmp/server-1.pem ]; then
+        echo "Server leaf details:"
+        openssl x509 -in /tmp/server-1.pem -noout -subject -issuer
+
+        leaf_issuer="$(openssl x509 -in /tmp/server-1.pem -noout -issuer | sed 's/^issuer=//')"
+        local_intermediate_subject="$(openssl x509 -in /tmp/local-intermediate.pem -noout -subject | sed 's/^subject=//')"
+        if ! printf '%s' "$leaf_issuer" | grep -Fq "$local_intermediate_subject"; then
+          echo "WARNING: Provided intermediate subject does not match leaf issuer." >&2
+          echo "  leaf issuer: ${leaf_issuer}" >&2
+          echo "  intermediate subject: ${local_intermediate_subject}" >&2
+          echo "If the server does not send intermediates, you must provide the exact issuing intermediate." >&2
+        fi
+
+        if ls /tmp/server-2.pem >/dev/null 2>&1; then
+          echo "Server provided intermediate(s):"
+          for f in /tmp/server-2.pem /tmp/server-3.pem /tmp/server-4.pem /tmp/server-5.pem; do
+            [ -f "$f" ] || continue
+            openssl x509 -in "$f" -noout -subject -issuer -fingerprint -sha256
+          done
+          cat /tmp/server-*.pem | awk 'BEGIN{c=0} /BEGIN CERTIFICATE/{c++} {if (c>=2) print}' > /tmp/server-chain.pem
+          openssl verify -CAfile /tmp/custom-bundle.crt -untrusted /tmp/server-chain.pem /tmp/server-1.pem || true
+        else
+          echo "WARNING: Server did not provide intermediate certificates in TLS handshake." >&2
+          openssl verify -CAfile /tmp/custom-bundle.crt /tmp/server-1.pem || true
+        fi
+      else
+        echo "WARNING: Unable to capture server certificate chain from ${host}." >&2
+        tail -n 50 /tmp/s_client.log >&2 || true
+      fi
+      fi  # end CI_SERVER_HOST check
+  script:
+    - |
+      echo "Checking if branch is up-to-date with ${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}..."
+      if ! git show-ref --verify --quiet "refs/remotes/origin/${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}"; then
+        echo "origin/${CI_MERGE_REQUEST_TARGET_BRANCH_NAME} not present locally; fetching it..."
+        git fetch origin "${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}"
+      fi
+      if ! git merge-base --is-ancestor "origin/${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}" HEAD; then
+        echo ""
+        echo "================================================================"
+        echo "ERROR: Branch is NOT up-to-date with ${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}"
+        echo "================================================================"
+        echo ""
+        echo "Another developer may have merged infrastructure changes that"
+        echo "your branch does not include. Merging now could REVERT those changes."
+        echo ""
+        echo "Please check your branch aginist the current branch called ${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}:"
+        echo "Look for configuration difference / changes."
+        echo "Consider for what resources are already created / changed in the branch ${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}."
+        echo "Please rebase your branch:"
+        echo "  git fetch origin ${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}"
+        echo "  git rebase origin/${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}"
+        echo "  git push --force-with-lease"
+        exit 1
+      fi
+      echo "Branch is up-to-date with ${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}."
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+
+check-checkov:
+  stage: security-check
+  image:
+    name: docker.io/bridgecrew/checkov:3.2.524@sha256:ff2470bec6ba7b4c8dbd8992940ea02b250e9138bee538b4aa50d4641aecf9a7
+    pull_policy: if-not-present
+    entrypoint:
+      - '/usr/bin/env'
+      - 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+  script:
+    - checkov -d . --skip-path gitlab-ci.yml\* -o gitlab_sast -o junitxml -o cli --output-file-path checkov-gitlab-sast.json,checkov-report.xml,console
+  artifacts:
+    when: always
+    reports:
+      sast: "checkov-gitlab-sast.json"
+      junit: "checkov-report.xml"
+    paths:
+      - "checkov-gitlab-sast.json"
+      - "checkov-report.xml"
+  allow_failure: false
+
+check-terrascan:
+  stage: security-check
+  image:
+    name: docker.io/tenable/terrascan:1.19.9@sha256:3e746279b99a55befb79ed6a110387b152f15d01e6ffabca8a478881ac720d1d
+    pull_policy: if-not-present
+    entrypoint:
+      - '/usr/bin/env'
+      - 'PATH=/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+  script:
+    - |
+      set -euo pipefail
+      terrascan version
+      terrascan scan -i terraform -t aws -o sarif | tee terrascan-sarif.json
+  artifacts:
+    when: always
+    paths:
+      - terrascan-sarif.json
+  allow_failure: false
+
+check-custom-gitleaks:
+  stage: security-check
+  cache: []
+  image:
+    name: ghcr.io/gitleaks/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
+    pull_policy: if-not-present
+    entrypoint:
+      - '/usr/bin/env'
+  script:
+    - gitleaks dir . -f sarif -i .terraform -r gitleaks-sarif.json --redact=70
+  artifacts:
+    when: always
+    paths:
+      - "gitleaks-sarif.json"
+  allow_failure: false
+
+.check-terrascan-to-sast-gl-by-python:
+  stage: security-check-to-sast
+  needs:
+    - job: check-terrascan
+      artifacts: true
+  image:
+    name: public.ecr.aws/docker/library/python:3.14-alpine@sha256:dd4d2bd5b53d9b25a51da13addf2be586beebd5387e289e798e4083d94ca837a
+    pull_policy: if-not-present
+    entrypoint: [""]
+  script:
+    - apk update && apk add --no-cache curl
+    - pip install --no-cache-dir --break-system-packages sarif-tools
+    - sarif --version
+    - sarif codeclimate terrascan-sarif.json -o gl-code-quality-terrascan.json
+  artifacts:
+    when: always
+    reports:
+      sast: gl-code-quality-terrascan.json
+    paths:
+      - terrascan-sarif.json
+      - gl-code-quality-terrascan.json
+
+check-terrascan-to-sast-gl-by-semgrep:
+  stage: security-check-to-sast
+  when: always
+  needs:
+    - job: check-terrascan
+      artifacts: true
+  image:
+    name: registry.gitlab.com/security-products/semgrep:6.18.0@sha256:eee069b90c132f54700476235d12bb3fe130be6829bfd58c0377647f35199153
+    pull_policy: if-not-present
+    entrypoint: [""]
+  script:
+    - /analyzer convert terrascan-sarif.json > gl-sast-report-temp.json
+    - /analyzer-tracking process --report gl-sast-report-temp.json --output gl-sast-report-terrascan.json --repository .
+  artifacts:
+    when: always
+    reports:
+      sast: gl-sast-report-terrascan.json
+    paths:
+      - terrascan-sarif.json
+      - gl-sast-report-terrascan.json
+
+check-trivy:
+  stage: security-check
+  image:
+    name: public.ecr.aws/aquasecurity/trivy:0.70.0@sha256:be1190afcb28352bfddc4ddeb71470835d16462af68d310f9f4bca710961a41e
+    pull_policy: if-not-present
+    entrypoint:
+      - '/usr/bin/env'
+  script:
+    - set -euo pipefail
+    - trivy version
+    - >
+      trivy
+      config --severity CRITICAL,HIGH
+      --skip-dirs .terraform
+      --skip-files ./.gitlab-ci.yml\*
+      --format sarif
+      .
+      | tee trivy-sarif.json
+  artifacts:
+    when: always
+    paths:
+      - trivy-sarif.json
+  allow_failure: false
+
+check-trivy-to-sast-gl-by-semgrep:
+  stage: security-check-to-sast
+  when: always
+  needs:
+    - job: check-trivy
+      artifacts: true
+  image:
+    name: registry.gitlab.com/security-products/semgrep:6.18.0@sha256:eee069b90c132f54700476235d12bb3fe130be6829bfd58c0377647f35199153
+    pull_policy: if-not-present
+    entrypoint: [""]
+  script:
+    - /analyzer convert trivy-sarif.json > gl-sast-report-temp.json
+    - /analyzer-tracking process --report gl-sast-report-temp.json --output gl-sast-report-trivy.json --repository .
+  artifacts:
+    when: always
+    reports:
+      sast: gl-sast-report-trivy.json
+    paths:
+      - trivy-sarif.json
+      - gl-sast-report-trivy.json

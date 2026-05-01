@@ -1,0 +1,95 @@
+# Optional Vault helper job anchors.
+#
+# Include this file only when you need Vault-based secret retrieval in your
+# pipeline. These are hidden jobs (anchors) and do not run on their own.
+#
+# Usage (consumer repo root .gitlab-ci.yml):
+#   include:
+#     - project: '<your-group>/tg-s3-gl-terramate-template'
+#       ref: '<tag-or-sha>'
+#       file: 'templates/debug-vault-helpers.yml'
+#
+# Then extend a real job with one of the anchors below:
+#   my-vault-job:
+#     extends: .manual_authentication
+#     stage: syntax-check
+
+# Manually authenticate with Vault using JWT and retrieve a KV secret.
+# Requires: VAULT_ADDR, VAULT_ID_TOKEN_AUDIENCE, VAULT_AUTH_ROLE
+# Optional: VAULT_AUTH_PATH (defaults to jwt)
+.manual_authentication:
+  stage: syntax-check
+  variables:
+    VAULT_SKIP_VERIFY: true
+    VAULT_LOG_LEVEL: debug
+  image:
+    name: public.ecr.aws/hashicorp/vault:1.21.4@sha256:4e33b126a59c0c333b76fb4e894722462659a6bec7c48c9ee8cea56fccfd2569
+  id_tokens:
+    VAULT_ID_TOKEN:
+      aud: ${VAULT_ID_TOKEN_AUDIENCE}
+  script:
+    - |
+      apk add --no-cache jq
+      auth_path="${VAULT_AUTH_PATH:-jwt}"
+      ## -------------------------------------
+      ## WARNING: These are only for debugging
+      ## WARNING: One should not expose the TOKEN in the logs of CICD pipeline
+      echo "debug: next is split of part one of VAULT_ID_TOKEN"
+      echo "$VAULT_ID_TOKEN" | cut -d . -f1
+      echo "debug: next is split of part two of VAULT_ID_TOKEN"
+      echo "$VAULT_ID_TOKEN" | cut -d . -f2
+      echo "debug: next is split of part three of VAULT_ID_TOKEN"
+      echo "$VAULT_ID_TOKEN" | cut -d . -f3
+      ## -------------------------------------
+      vault write -output-curl-string -field=token "auth/${auth_path}/login" role=${VAULT_AUTH_ROLE} jwt=$VAULT_ID_TOKEN
+      export VAULT_TOKEN="$(vault write -field=token "auth/${auth_path}/login" role=${VAULT_AUTH_ROLE} jwt=$VAULT_ID_TOKEN)"
+      export PGPASSWORD_1="$(vault kv get -field=PGPASSWORD_TEST kv-terraform-grafana/terraform/pg)"
+      ## WARNING: These are only for debugging
+      echo "VAULT_TOKEN is $VAULT_TOKEN"
+      echo "PGPASSWORD_1 is $PGPASSWORD_1"
+
+# Decode and print the JWT payload for debugging.
+# Requires: VAULT_ID_TOKEN_AUDIENCE, VAULT_ADDR, VAULT_AUTH_ROLE
+# Optional: VAULT_AUTH_PATH (defaults to jwt)
+.debug-jwt:
+  stage: syntax-check
+  image:
+    name: public.ecr.aws/docker/library/alpine:3.23.4@sha256:310c62b5e7ca5b08167e4384c68db0fd2905dd9c7493756d356e893909057601
+    pull_policy: if-not-present
+    entrypoint: [""]
+  id_tokens:
+    VAULT_ID_TOKEN:
+      aud: ${VAULT_ID_TOKEN_AUDIENCE}
+  variables:
+    VAULT_SERVER_URL: ${VAULT_ADDR}
+  script:
+    - apk add --no-cache jq
+    - echo "---- JWT PAYLOAD ----"
+    - echo "$VAULT_ID_TOKEN" | cut -d . -f2 | base64 -d | jq .
+    - echo "sub = $( echo "$VAULT_ID_TOKEN" | cut -d . -f2 | base64 -d | jq -r .sub )"
+    - echo "aud = $( echo "$VAULT_ID_TOKEN" | cut -d . -f2 | base64 -d | jq -r .aud )"
+
+# Use Vault secrets in a CI job via GitLab's native secrets integration.
+# Requires GitLab Premium or Ultimate.
+# Requires: VAULT_ID_TOKEN_AUDIENCE, VAULT_ADDR, VAULT_AUTH_ROLE
+# Optional: VAULT_AUTH_PATH (defaults to jwt)
+.get-vault-gl-premium:
+  stage: syntax-check
+  id_tokens:
+    VAULT_ID_TOKEN:
+      aud: ${VAULT_ID_TOKEN_AUDIENCE}
+  secrets:
+    PGPASSWORD_FROM_VAULT:
+      token: $VAULT_ID_TOKEN
+      file: false
+      vault:
+        engine:
+          name: kv-v2
+          path: kv-terraform-grafana
+        path: terraform/pg
+        field: PGPASSWORD
+  variables:
+    VAULT_SERVER_URL: ${VAULT_ADDR}
+  script:
+    - |
+      echo "Using secret $PGPASSWORD_FROM_VAULT"

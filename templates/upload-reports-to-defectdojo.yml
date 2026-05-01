@@ -1,0 +1,108 @@
+include:
+  - local: 'templates/iac-base.yml'
+
+upload:
+  stage: upload-reports-to-defect-dojo
+  extends: .terramate_template_local_ca_init
+  when: always
+  needs:
+    - job: syntax-tflint
+      artifacts: true
+    - job: check-custom-kics
+      artifacts: true
+    - job: check-checkov
+      artifacts: true
+    - job: check-custom-gitleaks
+      artifacts: true
+    - job: check-terrascan
+      artifacts: true
+    - job: check-trivy
+      artifacts: true
+    - job: check-terrascan-to-sast-gl-by-semgrep
+      artifacts: true
+    - job: check-trivy-to-sast-gl-by-semgrep
+      artifacts: true
+  image:
+    name: public.ecr.aws/docker/library/alpine:3.23.4@sha256:310c62b5e7ca5b08167e4384c68db0fd2905dd9c7493756d356e893909057601
+    pull_policy: if-not-present
+    entrypoint: [""]
+  script:
+    - |
+      for var in DEFECTDOJO_URL DEFECTDOJO_API_KEY DEFECTDOJO_ENGAGEMENT_ID; do
+        eval "val=\${${var}:-}"
+        if [ -z "${val}" ]; then
+          echo "ERROR: Required variable '${var}' is not set. Configure it in CI/CD variables." >&2
+          exit 1
+        fi
+      done
+    - apk add --no-cache curl
+    - SARIF_REPORT_FILES="tflint-sarif.json gitleaks-sarif.json terrascan-sarif.json trivy-sarif.json"
+    - echo "Starting DefectDojo uploads..."
+    - |
+      for report_file in $SARIF_REPORT_FILES; do
+        echo "--------------------------------------------------"
+        echo "Processing file: ${report_file}"
+
+        if [ -f "${report_file}" ]; then
+          echo "Uploading ${report_file} to DefectDojo..."
+          curl --request POST \
+            --url "${DEFECTDOJO_URL}/api/v2/import-scan/" \
+            --header "Authorization: Token ${DEFECTDOJO_API_KEY}" \
+            --header "Content-Type: multipart/form-data" \
+            --form "scan_type=SARIF" \
+            --form "engagement=${DEFECTDOJO_ENGAGEMENT_ID}" \
+            --form "file=@${report_file}" \
+            --form "active=true" \
+            --form "verified=false" \
+            --fail
+
+          CURL_EXIT_CODE=$?
+          if [ ${CURL_EXIT_CODE} -ne 0 ]; then
+            echo "ERROR: curl failed to upload ${report_file} with exit code ${CURL_EXIT_CODE}."
+            exit 1
+          else
+            echo "Successfully uploaded ${report_file}."
+          fi
+        else
+          echo "WARNING: Report file '${report_file}' not found. Skipping upload."
+          exit 1
+        fi
+      done
+
+    - echo "--------------------------------------------------"
+    - echo "All DefectDojo uploads of SARIF attempted."
+    - GL_SAST_REPORT_FILES="gl-sast-custom-kics.json checkov-gitlab-sast.json"
+    - echo "Starting DefectDojo uploads..."
+    - |
+      for report_file in $GL_SAST_REPORT_FILES; do
+        echo "--------------------------------------------------"
+        echo "Processing file: ${report_file}"
+
+        if [ -f "${report_file}" ]; then
+          echo "Uploading ${report_file} to DefectDojo..."
+          curl --request POST \
+            --url "${DEFECTDOJO_URL}/api/v2/import-scan/" \
+            --header "Authorization: Token ${DEFECTDOJO_API_KEY}" \
+            --header "Content-Type: multipart/form-data" \
+            --form "scan_type=GitLab SAST Report" \
+            --form "engagement=${DEFECTDOJO_ENGAGEMENT_ID}" \
+            --form "file=@${report_file}" \
+            --form "active=true" \
+            --form "verified=false" \
+            --fail
+
+          CURL_EXIT_CODE=$?
+          if [ ${CURL_EXIT_CODE} -ne 0 ]; then
+            echo "ERROR: curl failed to upload ${report_file} with exit code ${CURL_EXIT_CODE}."
+            exit 1
+          else
+            echo "Successfully uploaded ${report_file}."
+          fi
+        else
+          echo "WARNING: Report file '${report_file}' not found. Skipping upload."
+          exit 1
+        fi
+      done
+
+    - echo "-------------------------------------------------------------"
+    - echo "All DefectDojo uploads of GitLab SAST reports were attempted."

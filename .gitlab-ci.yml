@@ -1,0 +1,29 @@
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS'
+      when: never
+
+stages:
+  - syntax-check
+  - plan
+  - security-check
+  - security-check-to-sast
+  - upload-reports-to-defect-dojo
+  - apply
+
+# This root pipeline is the template repository's own integration pipeline.
+# It consumes the exported shared YAML locally so template changes are exercised
+# here before future caller repositories adopt them with include:project.
+#
+# custom-homelab-defaults.yml: homelab-specific overrides (image, Vault addr).
+#   Consumer repos in other environments should NOT include this file.
+# debug-vault-helpers.yml: an example template only for debugging
+#   FIXME: For serious use, you need to develope a proper helper template for Vault
+include:
+  - local: 'templates/custom-homelab-defaults.yml'
+  - local: 'templates/debug-vault-helpers.yml'
+  - local: 'templates/terramate-security.yml'
+  - local: 'templates/terramate-plan-apply.yml'
+  - local: 'templates/terramate-upload.yml'

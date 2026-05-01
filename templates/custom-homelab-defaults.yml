@@ -1,0 +1,16 @@
+# This file is an example on home to set the custom default values
+# It is specific to a homelab setting.
+#
+# Homelab-specific variable overrides for this template repository's own
+# self-test pipeline. Do NOT include this file in other environments.
+#
+# Consumer repos in other environments should declare their own image,
+# Vault address, and other environment-specific variables in their own
+# CI/CD settings or root .gitlab-ci.yml.
+
+variables:
+  IAC_PIPELINE_IMAGE: "gitlab-registry.local.nonet/homelab/containers/atlantis-custom-image:v0.9.53"
+  VAULT_ADDR: "https://vault.local.nonet"
+  VAULT_ID_TOKEN_AUDIENCE: "https://vault.local.nonet"
+  VAULT_AUTH_ROLE: "gitlab-cicd"
+  VAULT_AUTH_PATH: "jwt"

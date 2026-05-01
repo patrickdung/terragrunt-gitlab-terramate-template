@@ -1,0 +1,532 @@
+include:
+  - local: 'templates/iac-base.yml'
+
+.terramate_template_plan_base:
+  stage: plan
+  image: "${IAC_PIPELINE_IMAGE}"
+  resource_group: "${IAC_RESOURCE_GROUP}"
+  variables:
+    GIT_STRATEGY: clone
+    GIT_DEPTH: 0
+    # In my setup, I am using self signed CA in our self managed GitLab instance
+    SSL_CERT_FILE: /tmp/ci-ca-bundle.crt
+    # AWS_CA_BUNDLE should be required by different aws/tf/tg tools
+    AWS_CA_BUNDLE: /tmp/ci-ca-bundle.crt
+  before_script:
+    - |
+      set -euo pipefail
+
+      if [ -f /etc/ssl/certs/ca-certificates.crt ]; then
+        cp /etc/ssl/certs/ca-certificates.crt /tmp/ci-ca-bundle.crt
+      elif [ -f /etc/pki/tls/certs/ca-bundle.crt ]; then
+        cp /etc/pki/tls/certs/ca-bundle.crt /tmp/ci-ca-bundle.crt
+      else
+        touch /tmp/ci-ca-bundle.crt
+      fi
+      if [ -n "${LOCAL_INTERMEDIATE_CA_CERT_FILE:-}" ] && [ -f "${LOCAL_INTERMEDIATE_CA_CERT_FILE}" ]; then
+        echo "Appending intermediate CA: ${LOCAL_INTERMEDIATE_CA_CERT_FILE}"
+        printf '\n' >> /tmp/ci-ca-bundle.crt
+        cat "${LOCAL_INTERMEDIATE_CA_CERT_FILE}" >> /tmp/ci-ca-bundle.crt
+      fi
+      if [ -n "${LOCAL_ROOT_CA_CERT_FILE:-}" ] && [ -f "${LOCAL_ROOT_CA_CERT_FILE}" ]; then
+        echo "Appending root CA: ${LOCAL_ROOT_CA_CERT_FILE}"
+        printf '\n' >> /tmp/ci-ca-bundle.crt
+        cat "${LOCAL_ROOT_CA_CERT_FILE}" >> /tmp/ci-ca-bundle.crt
+      fi
+      for runner_ca in \
+          /usr/local/share/ca-certificates/ca-cert-ca.pem \
+          /etc/ssl/certs/ca-cert-ca.pem \
+          /usr/share/ca-certificates/ca-cert-ca.pem; do
+        if [ -f "${runner_ca}" ]; then
+          echo "Appending runner-injected CA bundle: ${runner_ca}"
+          printf '\n' >> /tmp/ci-ca-bundle.crt
+          cat "${runner_ca}" >> /tmp/ci-ca-bundle.crt
+          break
+        fi
+      done
+      echo "CA bundle ready: /tmp/ci-ca-bundle.crt ($(wc -l < /tmp/ci-ca-bundle.crt) lines)"
+
+      if [ -n "${SOPS_AGE_KEY:-}" ]; then
+        umask 077
+        printf '%s' "${SOPS_AGE_KEY}" | tr -d '\r' > /tmp/sops-age.key
+        printf '\n' >> /tmp/sops-age.key
+        export SOPS_AGE_KEY_FILE=/tmp/sops-age.key
+      fi
+      if [ -n "${SOPS_AGE_KEY_FILE:-}" ]; then
+        if [ ! -r "${SOPS_AGE_KEY_FILE}" ]; then
+          echo "ERROR: SOPS_AGE_KEY_FILE is set but not readable: ${SOPS_AGE_KEY_FILE}" >&2
+          exit 1
+        fi
+
+        first_key_line="$(awk 'NF { print; exit }' "${SOPS_AGE_KEY_FILE}" || true)"
+        case "${first_key_line}" in
+          AGE-SECRET-KEY-1*)
+            echo "SOPS age key: configured via SOPS_AGE_KEY_FILE=${SOPS_AGE_KEY_FILE}"
+            ;;
+          age1*)
+            echo "ERROR: SOPS age key looks like a public recipient, not a private identity." >&2
+            echo "Expected the first non-empty line to start with AGE-SECRET-KEY-1." >&2
+            exit 1
+            ;;
+          -----BEGIN\ AGE\ ENCRYPTED\ FILE-----*)
+            echo "ERROR: SOPS age key looks like an encrypted age file, not a decrypted private identity." >&2
+            exit 1
+            ;;
+          "")
+            echo "ERROR: SOPS age key file is empty: ${SOPS_AGE_KEY_FILE}" >&2
+            exit 1
+            ;;
+          *)
+            echo "ERROR: SOPS age key does not look like an age private identity." >&2
+            echo "First non-empty line: ${first_key_line}" >&2
+            exit 1
+            ;;
+        esac
+
+        if command -v age-keygen >/dev/null 2>&1; then
+          derived_recipient="$(age-keygen -y "${SOPS_AGE_KEY_FILE}" 2>/dev/null || true)"
+          if [ -n "${derived_recipient}" ]; then
+            echo "SOPS age recipient derived from CI key: ${derived_recipient}"
+          else
+            echo "WARNING: age-keygen is available but could not derive a recipient from ${SOPS_AGE_KEY_FILE}" >&2
+          fi
+        else
+          echo "NOTE: age-keygen not available; skipping recipient derivation"
+        fi
+      else
+        echo "SOPS age key: NOT configured (SOPS_AGE_KEY/SOPS_AGE_KEY_FILE missing)"
+      fi
+
+      git config --global --add safe.directory "${CI_PROJECT_DIR}"
+      mkdir -p "${HOME}/.terraform.d/plugins"
+
+plan-mr-preview:
+  extends:
+    - .terramate_template_plan_base
+  script:
+    - |
+      set -euo pipefail
+      cd ${TF_ROOT}
+      echo "TLS env: SSL_CERT_FILE=${SSL_CERT_FILE:-} AWS_CA_BUNDLE=${AWS_CA_BUNDLE:-}"
+      echo "================================================================"
+      echo "MR preview only:"
+      echo "1) This plan is advisory and is NOT the saved plan that "
+      echo "will be applied later. The deployable saved plan is generated"
+      echo "at the 'plan-main' task after merging to the main branch."
+      echo "2) tf-summarize and tfplan2md are the tools to detect changes"
+      echo "They are best effort and may have bugs."
+      echo "================================================================"
+
+      if ! command -v openssl >/dev/null 2>&1; then
+        echo "ERROR: openssl is required but was not found in PATH."
+        exit 1
+      fi
+
+      if ! command -v tf-summarize >/dev/null 2>&1; then
+        echo "WARNING: tf-summarize was not found. Text plan summary will be skipped."
+      fi
+
+      TFPLAN2MD_BIN=""
+      if command -v tfplan2md >/dev/null 2>&1; then
+        TFPLAN2MD_BIN="$(command -v tfplan2md)"
+      elif [ -x /app/tfplan2md ]; then
+        TFPLAN2MD_BIN="/app/tfplan2md"
+      else
+        echo "WARNING: tfplan2md was not found. Markdown plan rendering will be skipped."
+      fi
+
+      PLAN_ROOT="${TF_ROOT}/.terragrunt-plans"
+      rm -rf "${PLAN_ROOT}"
+      mkdir -p "${PLAN_ROOT}"
+
+      CHANGED_STACKS="$(terramate list --changed)"
+      if [ -z "${CHANGED_STACKS}" ]; then
+        echo "No changed stacks detected. Nothing to plan."
+        exit 0
+      fi
+
+      echo "Changed stacks to plan:"
+      echo "${CHANGED_STACKS}"
+      while IFS= read -r rel_module_dir; do
+        module_dir="${TF_ROOT}/${rel_module_dir}"
+        safe_module_name="$(echo "${rel_module_dir}" | sed 's#[/ ]#_#g')"
+        module_plan_file="${PLAN_ROOT}/${safe_module_name}.tfplan"
+        module_show_file="${PLAN_ROOT}/${safe_module_name}.show.json"
+
+        echo "Planning stack: ${rel_module_dir}"
+        (
+          cd "${module_dir}"
+          terragrunt init -reconfigure
+
+          plan_extra_args=()
+          if grep -R --include='*.tf' -nE '^[[:space:]]*variable[[:space:]]+"tf_state_name"' . >/dev/null 2>&1; then
+            plan_extra_args+=("-var=tf_state_name=${TF_STATE_NAME}")
+          fi
+
+          terragrunt plan -out "${module_plan_file}" "${plan_extra_args[@]}"
+          terragrunt show -json "${module_plan_file}" > "${module_show_file}"
+
+          if command -v tf-summarize >/dev/null 2>&1; then
+            echo "--- tf-summarize (${rel_module_dir}) ---"
+            ( tf-summarize -tree -draw < "${module_show_file}" ) || true
+          fi
+
+          if [ -n "${TFPLAN2MD_BIN}" ]; then
+            echo "--- tfplan2md (${rel_module_dir}) ---"
+            ( "${TFPLAN2MD_BIN}" --render-target github < "${module_show_file}" | glow - ) || true
+          fi
+
+          rm -f "${module_show_file}" "${module_plan_file}"
+        )
+      done <<< "${CHANGED_STACKS}"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+
+plan-main:
+  extends:
+    - .terramate_template_plan_base
+  script:
+    - |
+      set -euo pipefail
+      cd ${TF_ROOT}
+      echo "TLS env: SSL_CERT_FILE=${SSL_CERT_FILE:-} AWS_CA_BUNDLE=${AWS_CA_BUNDLE:-}"
+
+      if ! command -v openssl >/dev/null 2>&1; then
+        echo "ERROR: openssl is required but was not found in PATH."
+        exit 1
+      fi
+
+      if [ -z "${TF_STATE_ARTIFACT_ENCRYPTION_KEY:-}" ]; then
+        echo "ERROR: TF_STATE_ARTIFACT_ENCRYPTION_KEY is not set."
+        exit 1
+      fi
+
+      if ! command -v tf-summarize >/dev/null 2>&1; then
+        echo "WARNING: tf-summarize was not found. Text plan summary will be skipped."
+      fi
+
+      TFPLAN2MD_BIN=""
+      if command -v tfplan2md >/dev/null 2>&1; then
+        TFPLAN2MD_BIN="$(command -v tfplan2md)"
+      elif [ -x /app/tfplan2md ]; then
+        TFPLAN2MD_BIN="/app/tfplan2md"
+      else
+        echo "WARNING: tfplan2md was not found. Markdown plan rendering will be skipped."
+      fi
+
+      PLAN_ROOT="${TF_ROOT}/.terragrunt-plans"
+      MANIFEST_FILE="${PLAN_ROOT}/plan-manifest.txt"
+      REPORT_ROOT="${PLAN_ROOT}/reports"
+      rm -rf "${PLAN_ROOT}"
+      mkdir -p "${PLAN_ROOT}" "${REPORT_ROOT}"
+      : > "${MANIFEST_FILE}"
+
+      echo "================================================================"
+      echo "plan-main is the deployable saved plan for this main pipeline."
+      echo "1) Review the saved summaries under ${REPORT_ROOT} before using"
+      echo "the manual apply button for this pipeline."
+      echo "2) tf-summarize and tfplan2md are tools to detect changes"
+      echo "They are best effort and may have bugs."
+      echo "================================================================"
+
+      CHANGED_STACKS="$(terramate list --changed)"
+      if [ -z "${CHANGED_STACKS}" ]; then
+        echo "No changed stacks detected. Nothing to plan."
+        exit 0
+      fi
+      echo "Changed stacks to plan:"
+      echo "${CHANGED_STACKS}"
+
+      while IFS= read -r rel_module_dir; do
+        module_dir="${TF_ROOT}/${rel_module_dir}"
+        safe_module_name="$(echo "${rel_module_dir}" | sed 's#[/ ]#_#g')"
+        module_plan_file="${PLAN_ROOT}/${safe_module_name}.tfplan"
+        module_show_file="${PLAN_ROOT}/${safe_module_name}.show.json"
+        module_plan_encrypted_file="${module_plan_file}${PLAN_ENCRYPTED_SUFFIX}"
+        module_summary_file="${REPORT_ROOT}/${safe_module_name}.summary.txt"
+        module_markdown_file="${REPORT_ROOT}/${safe_module_name}.plan.md"
+        module_markdown_stderr_file="${REPORT_ROOT}/${safe_module_name}.plan.stderr.txt"
+        module_text_file="${REPORT_ROOT}/${safe_module_name}.plan.txt"
+
+        echo "Planning module: ${rel_module_dir}"
+        (
+          cd "${module_dir}"
+          terragrunt init -reconfigure
+
+          plan_extra_args=()
+          if grep -R --include='*.tf' -nE '^[[:space:]]*variable[[:space:]]+"tf_state_name"' . >/dev/null 2>&1; then
+            plan_extra_args+=("-var=tf_state_name=${TF_STATE_NAME}")
+          fi
+
+          terragrunt plan -out "${module_plan_file}" "${plan_extra_args[@]}"
+          terragrunt show -json "${module_plan_file}" > "${module_show_file}"
+
+          if command -v tf-summarize >/dev/null 2>&1; then
+            echo "--- tf-summarize (${rel_module_dir}) ---"
+            ( tf-summarize -tree -draw < "${module_show_file}" | tee "${module_summary_file}" ) || true
+          fi
+
+          if [ -n "${TFPLAN2MD_BIN}" ]; then
+            echo "--- tfplan2md (${rel_module_dir}) ---"
+            tfplan2md_exit=0
+            "${TFPLAN2MD_BIN}" --render-target github < "${module_show_file}" > "${module_markdown_file}" 2> "${module_markdown_stderr_file}" || tfplan2md_exit=$?
+
+            if [ -s "${module_markdown_file}" ]; then
+              ( "${TFPLAN2MD_BIN}" --render-target github < "${module_show_file}" | glow - ) || cat "${module_markdown_file}"
+            else
+              echo "WARNING: tfplan2md produced empty markdown for ${rel_module_dir}; falling back to plain-text plan output."
+              echo "--- terragrunt show fallback (${rel_module_dir}) ---"
+              ( terragrunt show "${module_plan_file}" | tee "${module_text_file}" ) || true
+            fi
+          fi
+
+          rm -f "${module_show_file}"
+
+          openssl enc -aes-256-cbc -pbkdf2 -salt \
+            -pass env:TF_STATE_ARTIFACT_ENCRYPTION_KEY \
+            -in "${module_plan_file}" \
+            -out "${module_plan_encrypted_file}"
+
+          rm -f "${module_plan_file}"
+        )
+
+        echo "${rel_module_dir}|${module_plan_encrypted_file}" >> "${MANIFEST_FILE}"
+      done <<< "${CHANGED_STACKS}"
+
+      if [ ! -s "${MANIFEST_FILE}" ]; then
+        echo "ERROR: manifest is empty after planning changed stacks"
+        exit 1
+      fi
+
+      echo "Plan manifest generated:"
+      cat "${MANIFEST_FILE}"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  artifacts:
+    access: developer
+    expire_in: 3 hours
+    paths:
+      - .terragrunt-plans/
+
+apply:
+  stage: apply
+  image: "${IAC_PIPELINE_IMAGE}"
+  resource_group: "${IAC_RESOURCE_GROUP}"
+  needs:
+    - job: plan-main
+      artifacts: true
+  variables:
+    GIT_DEPTH: 0
+    GIT_STRATEGY: fetch
+  before_script:
+    - |
+      set -euo pipefail
+
+      normalize_cert() {
+        input_path="$1"
+        output_path="$2"
+
+        if openssl x509 -in "$input_path" -noout >/dev/null 2>&1; then
+          openssl x509 -in "$input_path" -out "$output_path" >/dev/null 2>&1 || cp -f "$input_path" "$output_path"
+          return 0
+        fi
+
+        if openssl x509 -inform DER -in "$input_path" -noout >/dev/null 2>&1; then
+          openssl x509 -inform DER -in "$input_path" -out "$output_path"
+          return 0
+        fi
+
+        echo "ERROR: '$input_path' is not a valid X.509 certificate (PEM or DER)." >&2
+        return 1
+      }
+
+      if [ -f /etc/ssl/certs/ca-certificates.crt ]; then
+        cp /etc/ssl/certs/ca-certificates.crt /tmp/ci-ca-bundle.crt
+      elif [ -f /etc/pki/tls/certs/ca-bundle.crt ]; then
+        cp /etc/pki/tls/certs/ca-bundle.crt /tmp/ci-ca-bundle.crt
+      else
+        touch /tmp/ci-ca-bundle.crt
+      fi
+      if [ -n "${LOCAL_INTERMEDIATE_CA_CERT_FILE:-}" ] && [ -f "${LOCAL_INTERMEDIATE_CA_CERT_FILE}" ]; then
+        echo "Appending intermediate CA: ${LOCAL_INTERMEDIATE_CA_CERT_FILE}"
+        normalize_cert "${LOCAL_INTERMEDIATE_CA_CERT_FILE}" /tmp/local-intermediate.pem
+        printf '\n' >> /tmp/ci-ca-bundle.crt
+        cat /tmp/local-intermediate.pem >> /tmp/ci-ca-bundle.crt
+      fi
+      if [ -n "${LOCAL_ROOT_CA_CERT_FILE:-}" ] && [ -f "${LOCAL_ROOT_CA_CERT_FILE}" ]; then
+        echo "Appending root CA: ${LOCAL_ROOT_CA_CERT_FILE}"
+        normalize_cert "${LOCAL_ROOT_CA_CERT_FILE}" /tmp/local-root.pem
+        printf '\n' >> /tmp/ci-ca-bundle.crt
+        cat /tmp/local-root.pem >> /tmp/ci-ca-bundle.crt
+      fi
+      for runner_ca in \
+          /usr/local/share/ca-certificates/ca-cert-ca.pem \
+          /etc/ssl/certs/ca-cert-ca.pem \
+          /usr/share/ca-certificates/ca-cert-ca.pem; do
+        if [ -f "${runner_ca}" ]; then
+          echo "Appending runner-injected CA bundle: ${runner_ca}"
+          printf '\n' >> /tmp/ci-ca-bundle.crt
+          cat "${runner_ca}" >> /tmp/ci-ca-bundle.crt
+          break
+        fi
+      done
+      echo "CA bundle ready: /tmp/ci-ca-bundle.crt ($(wc -l < /tmp/ci-ca-bundle.crt) lines)"
+
+      export SSL_CERT_FILE=/tmp/ci-ca-bundle.crt
+      export AWS_CA_BUNDLE=/tmp/ci-ca-bundle.crt
+      export GIT_SSL_CAINFO=/tmp/ci-ca-bundle.crt
+      export CURL_CA_BUNDLE=/tmp/ci-ca-bundle.crt
+
+      git config --global http.sslCAInfo /tmp/ci-ca-bundle.crt
+      git config --global --add safe.directory "${CI_PROJECT_DIR}"
+
+      if [ -n "${SOPS_AGE_KEY:-}" ]; then
+        umask 077
+        printf '%s' "${SOPS_AGE_KEY}" | tr -d '\r' > /tmp/sops-age.key
+        printf '\n' >> /tmp/sops-age.key
+        export SOPS_AGE_KEY_FILE=/tmp/sops-age.key
+      fi
+      if [ -n "${SOPS_AGE_KEY_FILE:-}" ]; then
+        if [ ! -r "${SOPS_AGE_KEY_FILE}" ]; then
+          echo "ERROR: SOPS_AGE_KEY_FILE is set but not readable: ${SOPS_AGE_KEY_FILE}" >&2
+          exit 1
+        fi
+
+        first_key_line="$(awk 'NF { print; exit }' "${SOPS_AGE_KEY_FILE}" || true)"
+        case "${first_key_line}" in
+          AGE-SECRET-KEY-1*)
+            echo "SOPS age key: configured via SOPS_AGE_KEY_FILE=${SOPS_AGE_KEY_FILE}"
+            ;;
+          age1*)
+            echo "ERROR: SOPS age key looks like a public recipient, not a private identity." >&2
+            echo "Expected the first non-empty line to start with AGE-SECRET-KEY-1." >&2
+            exit 1
+            ;;
+          -----BEGIN\ AGE\ ENCRYPTED\ FILE-----*)
+            echo "ERROR: SOPS age key looks like an encrypted age file, not a decrypted private identity." >&2
+            exit 1
+            ;;
+          "")
+            echo "ERROR: SOPS age key file is empty: ${SOPS_AGE_KEY_FILE}" >&2
+            exit 1
+            ;;
+          *)
+            echo "ERROR: SOPS age key does not look like an age private identity." >&2
+            echo "First non-empty line: ${first_key_line}" >&2
+            exit 1
+            ;;
+        esac
+
+        if command -v age-keygen >/dev/null 2>&1; then
+          derived_recipient="$(age-keygen -y "${SOPS_AGE_KEY_FILE}" 2>/dev/null || true)"
+          if [ -n "${derived_recipient}" ]; then
+            echo "SOPS age recipient derived from CI key: ${derived_recipient}"
+          else
+            echo "WARNING: age-keygen is available but could not derive a recipient from ${SOPS_AGE_KEY_FILE}" >&2
+          fi
+        else
+          echo "NOTE: age-keygen not available; skipping recipient derivation"
+        fi
+      else
+        echo "SOPS age key: NOT configured (SOPS_AGE_KEY/SOPS_AGE_KEY_FILE missing)"
+      fi
+      mkdir -p "${HOME}/.terraform.d/plugins"
+  script:
+    - |
+      set -euo pipefail
+      cd ${TF_ROOT}
+      PLAN_ROOT="${TF_ROOT}/.terragrunt-plans"
+      MANIFEST_FILE="${PLAN_ROOT}/plan-manifest.txt"
+      default_branch="${CI_DEFAULT_BRANCH:-main}"
+
+      if ! command -v openssl >/dev/null 2>&1; then
+        echo "ERROR: openssl is required but was not found in PATH."
+        exit 1
+      fi
+
+      if ! command -v git >/dev/null 2>&1; then
+        echo "ERROR: git is required for the apply freshness check but was not found in PATH."
+        exit 1
+      fi
+
+      echo "Checking whether ${CI_COMMIT_SHA} is still the current origin/${default_branch} tip..."
+      git fetch --prune origin \
+        "+refs/heads/${default_branch}:refs/remotes/origin/${default_branch}"
+
+      current_origin_tip="$(git rev-parse "refs/remotes/origin/${default_branch}")"
+      if [ "${CI_COMMIT_SHA}" != "${current_origin_tip}" ]; then
+        echo "ERROR: this pipeline was created for commit ${CI_COMMIT_SHA}, but origin/${default_branch} now points to ${current_origin_tip}."
+        echo "Refusing to apply an older saved plan. Use the newest ${default_branch} pipeline instead."
+        exit 1
+      fi
+
+      echo "Freshness check passed: ${CI_COMMIT_SHA} is still the current origin/${default_branch} tip."
+
+      if [ -z "${TF_STATE_ARTIFACT_ENCRYPTION_KEY:-}" ]; then
+        echo "ERROR: TF_STATE_ARTIFACT_ENCRYPTION_KEY is not set."
+        exit 1
+      fi
+
+      if [ ! -f "${MANIFEST_FILE}" ]; then
+        echo "ERROR: plan manifest '${MANIFEST_FILE}' not found!"
+        exit 1
+      fi
+      if [ ! -s "${MANIFEST_FILE}" ]; then
+        echo "No changed stacks were planned. Nothing to apply."
+        exit 0
+      fi
+
+      while IFS='|' read -r rel_module_dir module_plan_encrypted_file; do
+        if [ "${rel_module_dir}" = "." ]; then
+          module_dir="${TF_ROOT}"
+        else
+          module_dir="${TF_ROOT}/${rel_module_dir}"
+        fi
+
+        if [ ! -f "${module_plan_encrypted_file}" ]; then
+          echo "ERROR: encrypted plan file '${module_plan_encrypted_file}' not found for module '${rel_module_dir}'"
+          exit 1
+        fi
+
+        module_plan_file="${module_plan_encrypted_file%${PLAN_ENCRYPTED_SUFFIX}}"
+
+        openssl enc -d -aes-256-cbc -pbkdf2 \
+          -pass env:TF_STATE_ARTIFACT_ENCRYPTION_KEY \
+          -in "${module_plan_encrypted_file}" \
+          -out "${module_plan_file}"
+
+        echo "=== PLAN TO BE APPLIED (${rel_module_dir}) ==="
+        (
+          cd "${module_dir}"
+          terragrunt show "${module_plan_file}"
+          echo "=== APPLYING SAVED PLAN (${rel_module_dir}) ==="
+          terragrunt apply "${module_plan_file}"
+        )
+
+        rm -f "${module_plan_file}"
+      done < "${MANIFEST_FILE}"
+
+      echo "All modules applied successfully. Deleting plan-main artifact to prevent replay..."
+      plan_main_job_id="$(
+        curl --silent --fail \
+          --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+          "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/pipelines/${CI_PIPELINE_ID}/jobs" \
+          | jq -r '.[] | select(.name == "plan-main") | .id'
+      )"
+
+      if [ -n "${plan_main_job_id}" ]; then
+        echo "Deleting artifacts for plan-main job ID: ${plan_main_job_id}"
+        curl --silent --fail \
+          --request DELETE \
+          --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+          "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/jobs/${plan_main_job_id}/artifacts" \
+          && echo "plan-main artifacts deleted." \
+          || echo "WARNING: artifact deletion request failed (non-fatal)."
+      else
+        echo "WARNING: could not find plan-main job ID in this pipeline; artifact not deleted."
+      fi
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual
+    - when: never
+  manual_confirmation: 'Confirm that you reviewed the plan/summary/artifacts for the task plan-main for this pipeline and want to apply that exact saved plan.'
