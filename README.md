@@ -95,8 +95,9 @@ The caller repository keeps ownership of its Terramate stack definitions, Terrag
 - `IAC_PIPELINE_IMAGE` — container image to use for plan/apply jobs
   - You need to have these tools installaed in the IaC pipeline container
     - [Terragrunt](https://github.com/gruntwork-io/terragrunt/)
-    - Terraform/OpenTofu - I tested with opentofu
+    - Terraform/OpenTofu - I tested with OpenTofu
     - [Terramate](https://github.com/terramate-io)
+    - openssl - For encrypting Terraform state as GitLab artifact
     - [tfsummarize](https://github.com/dineshba/tf-summarize)
     - [tfplan2md](https://github.com/oocx/tfplan2md)
     - [glow](https://github.com/charmbracelet/glow)
