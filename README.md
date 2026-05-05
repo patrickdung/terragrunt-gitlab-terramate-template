@@ -43,6 +43,17 @@ In that new pipeline:
     - If the user goes back to the previous pipeline to run the apply task, it should block
      - It would block because the previous task's git commit id/tip is not pointing to the latest one
 
+- Suppose the plan passed the plan stage. MR is merged.
+  A new task is spawn to work on the main branch.
+  But the pipeline failed in the middle before it can be applied.
+  i.e. the change in the IaC code is not applied to the related resources.
+  Another MR is created to fix the problem, but this template/design may not be able to
+  detect/aware that there are resource changes that had not been applied.
+  This will cause drifting.
+  - Users need to cater for these exception
+     - e.g. Force the changed code to go thorugh the pipeine again or
+     - Revert the changed code
+
 ## Exported Include Files
 
 * The templates are located in the `templates/` directory and are designed to be included in other GitLab projects. Detailed documentation for each template can be found in the [design/](design/) folder:
