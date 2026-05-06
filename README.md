@@ -12,22 +12,28 @@ There are some use cases where the users want a pure GitLab CI solution for use 
 
 So, in this template, it would:
 
-- Try to block users to run two Terragrunt with GitLab pipeline simultaneously (GitLab resource group)
-- Two different users or Git branches disregard / overwrite existing changes that is already commited in main branch (check-branch-freshness)
-- Apply Terragrunt should only apply a pre-defined Terraform plans. Instead of plan again and apply.
-- Users will be able to preview what would be changed (task 'plan-mr-preview') at merge request (MR)
+- Try to block users to run two Terragrunt with GitLab pipeline simultaneously (controlled by GitLab resource group)
+- Two different users or Git branches dis-regard / overwrite existing changes that is already commited in main branch (controled/checked by check-branch-freshness)
+- Applying Terragrunt should only apply a pre-defined Terraform plans. Instead of plan again right before applying.
+- Users will be able to preview what would be changed (task 'plan-mr-preview') at merge request (MR).
   - Plain Terraform output is hard to read. Use of tf-summarize and tfplan2md to help users to identify
 what would be changed
-- If MR looks good, user can merge the code to the main branch
+- If a MR looks good, users can merge the code to the main branch
   - A new pipeline will be created
     - Syntax checking will be run again
-    - Terragrunt/Terraform planning (task 'plan-main'), artifact (Terraform plan) will be encrypted and saved as GitLab artifacts
-    - If the user wants to run the Terragrunt apply, he/she needs to run the apply task manually in GitLab
-    - After the apply taks is run successfully, the plans (artifacts) would be deleted to prevent them to be re-run (accidentially)
+    - Terragrunt/Terraform planning (at task 'plan-main'), the Terraform plan will be encrypted and saved as GitLab artifacts
+    - If the user wants to apply the Terragrunt code, he/she needs to run the apply task manually in GitLab
+    - After the apply task has run successfully, the Terraform plans (artifacts) would be deleted to prevent them to be re-run (accidentially)
 - Other aspects
   - Use of Terramate to detect what resources is being changed
   - Security checking
   - I am using a self signed CA certificate for my homelabe environment. So, there would be settings for trusting the self signed CA certificate.
+
+## What configuration is required
+
+- Users need to onboard Terramate with their Terragrunt setting for each Terragrunt directory (needed for existing and new resources in the future)
+- GitLab pipeline
+  - Refer below for the variables needed
 
 ## Known behaviour or known problems
 
