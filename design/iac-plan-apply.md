@@ -14,4 +14,4 @@ The `iac-plan-apply.md` template implements the core deployment workflow for mul
 
 | Variable | Description | Required |
 |----------|-------------|----------|
-| `TF_STATE_ARTIFACT_ENCRYPTION_KEY` | Passphrase used to encrypt/decrypt binary Terraform plan files. | Undefined |
+| `TF_STATE_ARTIFACT_ENCRYPTION_KEY` | Passphrase used to encrypt/decrypt binary Terraform plan files. For this variable in GitLab, please remember to set protected and masked | Undefined |
