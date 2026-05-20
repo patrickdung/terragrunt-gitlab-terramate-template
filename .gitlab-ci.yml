@@ -24,6 +24,6 @@ stages:
 include:
   - local: 'templates/custom-homelab-defaults.yml'
   - local: 'templates/debug-vault-helpers.yml'
-  - local: 'templates/terramate-security.yml'
-  - local: 'templates/terramate-plan-apply.yml'
-  - local: 'templates/terramate-upload.yml'
+  - local: 'templates/iac-security.yml'
+  - local: 'templates/iac-plan-apply.yml'
+  - local: 'templates/upload-reports-to-defectdojo.yml'
