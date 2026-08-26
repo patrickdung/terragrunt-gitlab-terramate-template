@@ -59,6 +59,7 @@ syntax-tflint:
 
 terragrunt-hcl-validate-use-prebuilt-container:
   stage: syntax-check
+  cache: []
   image:
     name: "${IAC_PIPELINE_IMAGE}"
     pull_policy: if-not-present
@@ -91,6 +92,7 @@ check-custom-kics:
 
 check-branch-freshness:
   stage: syntax-check
+  cache: []
   image:
     name: public.ecr.aws/docker/library/alpine:3.23.4@sha256:310c62b5e7ca5b08167e4384c68db0fd2905dd9c7493756d356e893909057601
     pull_policy: if-not-present
@@ -210,6 +212,7 @@ check-branch-freshness:
 
 check-checkov:
   stage: security-check
+  cache: []
   image:
     name: docker.io/bridgecrew/checkov:3.2.524@sha256:ff2470bec6ba7b4c8dbd8992940ea02b250e9138bee538b4aa50d4641aecf9a7
     pull_policy: if-not-present
@@ -230,6 +233,7 @@ check-checkov:
 
 check-terrascan:
   stage: security-check
+  cache: []
   image:
     name: docker.io/tenable/terrascan:1.19.9@sha256:3e746279b99a55befb79ed6a110387b152f15d01e6ffabca8a478881ac720d1d
     pull_policy: if-not-present
@@ -287,6 +291,7 @@ check-custom-gitleaks:
 
 check-terrascan-to-sast-gl-by-semgrep:
   stage: security-check-to-sast
+  cache: []
   when: always
   needs:
     - job: check-terrascan
@@ -308,6 +313,7 @@ check-terrascan-to-sast-gl-by-semgrep:
 
 check-trivy:
   stage: security-check
+  cache: []
   image:
     name: public.ecr.aws/aquasecurity/trivy:0.70.0@sha256:be1190afcb28352bfddc4ddeb71470835d16462af68d310f9f4bca710961a41e
     pull_policy: if-not-present
@@ -332,6 +338,7 @@ check-trivy:
 
 check-trivy-to-sast-gl-by-semgrep:
   stage: security-check-to-sast
+  cache: []
   when: always
   needs:
     - job: check-trivy
