@@ -213,6 +213,8 @@ check-branch-freshness:
 check-checkov:
   stage: security-check
   cache: []
+  # set empty for dependencies so that it won't failed being unable to download artifacts of other failed job
+  dependencies: []
   image:
     name: docker.io/bridgecrew/checkov:3.2.524@sha256:ff2470bec6ba7b4c8dbd8992940ea02b250e9138bee538b4aa50d4641aecf9a7
     pull_policy: if-not-present
