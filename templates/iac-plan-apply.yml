@@ -509,7 +509,7 @@ apply:
       echo "All modules applied successfully. Deleting plan-main artifact to prevent replay..."
       plan_main_job_id="$(
         curl --silent --fail \
-          --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+          --header "PRIVATE-TOKEN: ${GITLAB_API_TOKEN}" \
           "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/pipelines/${CI_PIPELINE_ID}/jobs" \
           | jq -r '.[] | select(.name == "plan-main") | .id'
       )"
@@ -518,7 +518,7 @@ apply:
         echo "Deleting artifacts for plan-main job ID: ${plan_main_job_id}"
         curl --silent --fail \
           --request DELETE \
-          --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+          --header "PRIVATE-TOKEN: ${GITLAB_API_TOKEN}" \
           "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/jobs/${plan_main_job_id}/artifacts" \
           && echo "plan-main artifacts deleted." \
           || echo "WARNING: artifact deletion request failed (non-fatal)."

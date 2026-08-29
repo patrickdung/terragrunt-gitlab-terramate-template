@@ -121,6 +121,9 @@ The caller repository keeps ownership of its Terramate stack definitions, Terrag
 - `LOCAL_INTERMEDIATE_CA_CERT_FILE`
 - `LOCAL_ROOT_CA_CERT_FILE`
 - `TF_STATE_ARTIFACT_ENCRYPTION_KEY`
+- `GITLAB_API_TOKEN` — Project or group access token with `api` scope and Maintainer/Owner role. Used by the apply job
+ to delete `plan-main` artifacts after a successful apply to prevent replay. If unset, artifact deletion is skipped (n
+on-fatal).
 
 ## Optional CI/CD Variables
 
