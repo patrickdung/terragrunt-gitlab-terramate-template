@@ -19,6 +19,7 @@
 ```
 root-dir-of-repo/               # This repo
 ├── AGENTS.md                   # This file, for AI agents like Claude / Codex
+├── CHANGELOG.md                # Put major changes into CHANGELOG.md
 ├── README.md                   # readme
 ```
 

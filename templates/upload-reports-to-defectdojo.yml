@@ -3,7 +3,7 @@ include:
 
 upload:
   stage: upload-reports-to-defect-dojo
-  extends: .terramate_template_local_ca_init
+  extends: .iac_template_local_ca_init
   when: always
   needs:
     - job: syntax-tflint

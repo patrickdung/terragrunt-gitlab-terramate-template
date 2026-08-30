@@ -19,14 +19,14 @@ The `iac-base.yml` template serves as the foundation for the Terramate and Terra
 
 ## Core Components
 
-### `.terramate_template_local_ca_init` (Hidden Job/Anchor)
+### `.iac_template_local_ca_init` (Hidden Job/Anchor)
 A `before_script` helper that:
 1. Detects `ROOT_CA_PATH`.
 2. Normalizes line endings (dos2unix).
 3. Updates the system trust store (`update-ca-certificates`).
 4. Configures `AWS_CA_BUNDLE` and `VAULT_CAPATH` to ensure all tools trust the local CA.
 
-### Shared Job Configuration (`.terramate_template_base`)
+### Shared Job Configuration (`.iac_template_base`)
 All IaC jobs should extend this to inherit:
 - The custom `IAC_PIPELINE_IMAGE`.
 - Environment variable defaults.

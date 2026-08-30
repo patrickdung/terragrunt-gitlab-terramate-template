@@ -29,7 +29,7 @@ variables:
   VAULT_AUTH_ROLE: ""
   VAULT_AUTH_PATH: "jwt"
 
-.terramate_template_local_ca_init:
+.iac_template_local_ca_init:
   before_script:
     - |
       apk add --no-cache ca-certificates openssl

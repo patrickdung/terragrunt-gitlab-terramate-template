@@ -15,3 +15,4 @@ The `iac-plan-apply.md` template implements the core deployment workflow for mul
 | Variable | Description | Required |
 |----------|-------------|----------|
 | `TF_STATE_ARTIFACT_ENCRYPTION_KEY` | Passphrase used to encrypt/decrypt binary Terraform plan files. For this variable in GitLab, please remember to set protected and masked | Undefined |
+| `GITLAB_API_TOKEN` | Project or group access token (`api` scope, Maintainer/Owner role) used by `plan-mr-preview` to post the MR plan note, by `plan-main` to post the plan as a commit comment, and by `apply` to delete `plan-main` artifacts after a successful apply. If unset, note posting and artifact deletion are skipped (non-fatal). | Optional |

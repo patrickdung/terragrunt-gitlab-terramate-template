@@ -121,8 +121,7 @@ The caller repository keeps ownership of its Terramate stack definitions, Terrag
 - `LOCAL_INTERMEDIATE_CA_CERT_FILE`
 - `LOCAL_ROOT_CA_CERT_FILE`
 - `TF_STATE_ARTIFACT_ENCRYPTION_KEY`
-- `GITLAB_API_TOKEN` — Project or group access token with `api` scope and Maintainer/Owner role. Used by the apply job
- to delete `plan-main` artifacts after a successful apply to prevent replay. If unset, artifact deletion is skipped (n
+- `GITLAB_API_TOKEN` — Project or group access token with `api` scope and Maintainer/Owner role. Used by `plan-mr-preview` to post the MR plan note, by `plan-main` to post the plan as a commit comment, and by the apply job to delete `plan-main` artifacts after a successful apply to prevent replay. Add it as a **masked** CI/CD variable and leave it **unprotected** so MR pipelines from non-protected branches can read it. If unset, note posting and artifact deletion are skipped (non-fatal).
 on-fatal).
 
 ## Optional CI/CD Variables
