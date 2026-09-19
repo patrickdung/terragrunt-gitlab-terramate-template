@@ -31,6 +31,44 @@ All IaC jobs should extend this to inherit:
 - The custom `IAC_PIPELINE_IMAGE`.
 - Environment variable defaults.
 
+### `.iac_template_aws_ra_init` (Hidden Job/Anchor)
+
+An opt-in `before_script` helper for consumers that authenticate to AWS via
+**IAM Roles Anywhere** (`aws_signing_helper`). It is **disabled by default**
+(`AWS_RA_ENABLED: "false"`) and is a no-op unless the consumer explicitly
+enables it in its own `.gitlab-ci.yml`.
+
+When enabled, it:
+
+1. Validates all required `AWS_RA_*` variables are present (fail-fast with a
+   clear `ERROR:` message if not).
+2. Decodes the private key from `AWS_RA_CLIENT_KEY_BASE64` to
+   `${CI_PROJECT_DIR}/.aws-ra-client.key` (mode 400).
+3. Writes a `[profile ra]` section to `~/.aws/config` with a `credential_process`
+   pointing to `/usr/local/bin/aws_signing_helper`.
+4. Exports `AWS_PROFILE=ra` and `AWS_REGION` so Terraform/Terragrunt pick up the
+   Roles Anywhere credentials automatically.
+
+Required variables (set in consumer `.gitlab-ci.yml`):
+
+| Variable | Purpose |
+|----------|---------|
+| `AWS_RA_ENABLED` | Set to `"true"` to activate |
+| `AWS_RA_TRUST_ANCHOR_ARN` | Roles Anywhere trust anchor ARN |
+| `AWS_RA_PROFILE_ARN` | Roles Anywhere profile ARN |
+| `AWS_RA_ROLE_ARN` | IAM role ARN to assume |
+| `AWS_RA_REGION` | AWS region (optional, default `us-east-2`) |
+
+Required GitLab CI/CD variables (Settings → CI/CD → Variables):
+
+| Variable | Type | Protected | Masked | Purpose |
+|----------|------|-----------|--------|---------|
+| `AWS_RA_CLIENT_CERT_FILE` | File | ✅ | — | Runner x509 client cert (PEM) |
+| `AWS_RA_CLIENT_KEY_BASE64` | Variable | ✅ | ✅ | `base64 -w0` of the private key |
+
+The key is provided as base64 because a multi-line PEM private key **cannot be
+masked** as a GitLab CI/CD variable. Base64 is single-line and decodes cleanly.
+
 ## Workflow Impact
 
 This template must be included first in any pipeline to ensure the environment is correctly primed for security linting and deployment operations. Without the CA initialization, jobs interacting with Vault or Local S3 will fail TLS verification.

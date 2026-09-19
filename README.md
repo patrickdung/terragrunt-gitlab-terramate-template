@@ -18,6 +18,30 @@ So, in this template, it would:
 - Users will be able to preview what would be changed (task 'plan-mr-preview') at merge request (MR).
   - Plain Terraform output is hard to read. Use of tf-summarize and tfplan2md to help users to identify
 what would be changed
+  - The tfplan2md plan is posted as a single self-updating note on the MR (notes API),
+    so reviewers see the plan without opening the job log (Atlantis-like review UX)
+  - tf-summarize output is saved per stack as `.tf-summarize.md` and `.tf-summarize.html`
+    artifacts under `.terragrunt-plans/reports/`
+  - Additionally, `iam-policy-autopilot` derives **advisory least-privilege IAM
+    identity policies** from each stack's `terragrunt show -json` plan. The
+    pretty JSON per stack lands in the job log and is rendered into the **same
+    single MR plan note** as a collapsed `🔐 IAM policies` section (per-stack
+    ```json blocks + a `jq` statement count + a hint for `Warnings` wildcard
+    `Resource` statements; the `--pretty` JSON is saved as
+    `.terragrunt-plans/reports/<stack>.iam-policies.json` (a compact
+    `<stack>.iam-policies.compact.json` copy is kept alongside), and a `-- `
+    line after each `</details>` keeps the closing tag in its own paragraph.
+    All calls are
+    best-effort (`|| true`), so a missing binary or tool failure never fails
+    the plan. `plan-main` / `apply` do not generate or publish policies.
+    Telemetry is disabled (see `DISABLE_IAM_POLICY_AUTOPILOT_TELEMETRY` under
+    *Common Overrides*). The per-stack policies are always kept as artifacts;
+    set `IAM_POLICY_AUTOPILOT_TO_MR_COMMIT: "false"` to skip appending them to
+    the MR note (e.g. when many resources change and the generated policies
+    would make the MR comment huge) — see *Common Overrides*. The pretty JSON
+    is also echoed to the job log (the job trace); set
+    `IAM_POLICY_AUTOPILOT_APPEND_TO_JOB_LOG: "false"` to keep the log small on
+    large diffs — see *Common Overrides*.
 - If a MR looks good, users can merge the code to the main branch
   - A new pipeline will be created
     - Syntax checking will be run again
@@ -118,11 +142,43 @@ The caller repository keeps ownership of its Terramate stack definitions, Terrag
     - [tfsummarize](https://github.com/dineshba/tf-summarize)
     - [tfplan2md](https://github.com/oocx/tfplan2md)
     - [glow](https://github.com/charmbracelet/glow)
+    - [iam-policy-autopilot](https://github.com/awslabs/iam-policy-autopilot) -
+      advisory least-privilege IAM policy generation from Terraform plans
+      (MR preview only). Expected at `/usr/local/bin/iam-policy-autopilot`
 - `LOCAL_INTERMEDIATE_CA_CERT_FILE`
 - `LOCAL_ROOT_CA_CERT_FILE`
 - `TF_STATE_ARTIFACT_ENCRYPTION_KEY`
 - `GITLAB_API_TOKEN` — Project or group access token with `api` scope and Maintainer/Owner role. Used by `plan-mr-preview` to post the MR plan note, by `plan-main` to post the plan as a commit comment, and by the apply job to delete `plan-main` artifacts after a successful apply to prevent replay. Add it as a **masked** CI/CD variable and leave it **unprotected** so MR pipelines from non-protected branches can read it. If unset, note posting and artifact deletion are skipped (non-fatal).
 on-fatal).
+
+## Optional: AWS IAM Roles Anywhere (RA)
+
+The template supports AWS IAM Roles Anywhere authentication so the GitLab runner can
+assume an IAM role using an X.509 client certificate signed by your own on-prem CA —
+no static AWS access keys. Two pieces are required:
+
+1. **In the consumer repo's `.gitlab-ci.yml`** — set the flag and non-secret identifiers:
+
+```yaml
+variables:
+  AWS_RA_ENABLED: "true"
+  AWS_RA_REGION: "us-east-2"
+  AWS_RA_TRUST_ANCHOR_ARN: "arn:aws:rolesanywhere:..."
+  AWS_RA_PROFILE_ARN: "arn:aws:rolesanywhere:..."
+  AWS_RA_ROLE_ARN: "arn:aws:iam::...:role/..."
+```
+
+2. **In GitLab Settings → CI/CD → Variables** — set the secret material:
+
+| Variable | Type | Protected | Masked | Value |
+|----------|------|-----------|--------|-------|
+| `AWS_RA_CLIENT_CERT_FILE` | File | ✅ | — | Runner x509 client cert (PEM) |
+| `AWS_RA_CLIENT_KEY_BASE64` | Variable | ✅ | ✅ | `base64 -w0` of the matching private key |
+
+The key is provided as base64 because a multi-line PEM private key **cannot be masked**
+as a GitLab CI/CD variable. The template decodes it at runtime (`base64 -d`).
+The plan/apply jobs will fail fast with clear error messages if any `AWS_RA_*`
+variable is set but incomplete.
 
 ## Optional CI/CD Variables
 
@@ -143,6 +199,20 @@ These shared defaults can be overridden by caller repositories without editing t
 - `IAC_RESOURCE_GROUP`
 - `AWS_EC2_METADATA_DISABLED` — defaults to `false`
 - `VAULT_AUTH_PATH` — defaults to `jwt`
+- `DISABLE_IAM_POLICY_AUTOPILOT_TELEMETRY` — defaults to `"true"` (opt out of
+  iam-policy-autopilot telemetry). The env var has the highest precedence — it
+  beats the persisted `~/.iam-policy-autopilot/config.json` choice. A
+  best-effort `iam-policy-autopilot telemetry --disable` is also run in the
+  plan job. Set to `"false"` only if you explicitly want telemetry.
+- `IAM_POLICY_AUTOPILOT_TO_MR_COMMIT` — defaults to `"true"`. The generated
+  IAM policies are always kept as `plan-mr-preview` artifacts
+  (`.terragrunt-plans/reports/<stack>.iam-policies.json`). Set to `"false"` to
+  skip appending them to the MR plan note — useful when many resources change
+  and the policies would make the MR comment very large.
+- `IAM_POLICY_AUTOPILOT_APPEND_TO_JOB_LOG` — defaults to `"true"`. The pretty
+  JSON is also echoed to the `plan-mr-preview` job log (the job trace, not
+  the MR comment). Set to `"false"` to keep the job log small when many
+  resources change; the artifacts and the optional MR comment still exist.
 
 ## Notes
 

@@ -12,9 +12,51 @@ include:
     SSL_CERT_FILE: /tmp/ci-ca-bundle.crt
     # AWS_CA_BUNDLE should be required by different aws/tf/tg tools
     AWS_CA_BUNDLE: /tmp/ci-ca-bundle.crt
+    # CURL_CA_BUNDLE is read by curl (SSL_CERT_FILE is NOT read by curl).
+    # Required for post_plan_note curl calls to the GitLab API over TLS.
+    CURL_CA_BUNDLE: /tmp/ci-ca-bundle.crt
+    # iam-policy-autopilot telemetry: env var has the highest precedence (beats
+    # the persisted ~/.iam-policy-autopilot/config.json choice), so policy
+    # generation never phones home even on the first run of a fresh job
+    # container. The per-job `telemetry --disable` call is a belt-and-braces
+    # persisted fallback.
+    DISABLE_IAM_POLICY_AUTOPILOT_TELEMETRY: "true"
+    # iam-policy-autopilot MR comment switch. The per-stack policies are
+    # ALWAYS generated and kept as plan-mr-preview artifacts
+    # (.terragrunt-plans/reports/*.iam-policies.json). Set to "false" in a
+    # consumer repo to skip appending them to the MR plan comment (useful when
+    # many resources change -> large generated policies -> huge MR comment).
+    IAM_POLICY_AUTOPILOT_TO_MR_COMMENT: "true"
+    # iam-policy-autopilot job-log switch. The pretty JSON is also echoed to
+    # the plan-mr-preview job log (the job trace, NOT the MR comment); set to
+    # "false" to keep the log small when many resources change (the artifacts
+    # and the optional MR comment still exist).
+    IAM_POLICY_AUTOPILOT_APPEND_TO_JOB_LOG: "true"
   before_script:
     - |
       set -euo pipefail
+
+      normalize_cert() {
+        local input_path="$1" output_path="$2"
+        # Multi-cert PEM bundle (e.g. old + re-issued intermediate): copy as-is.
+        # openssl x509 would only keep the FIRST cert, dropping the rest.
+        local count
+        count="$(grep -c -- '-----BEGIN CERTIFICATE-----' "$input_path" 2>/dev/null || echo 0)"
+        if [ "${count:-0}" -gt 1 ]; then
+          cp -f "$input_path" "$output_path"
+          return 0
+        fi
+        if openssl x509 -in "$input_path" -noout >/dev/null 2>&1; then
+          openssl x509 -in "$input_path" -out "$output_path" >/dev/null 2>&1 || cp -f "$input_path" "$output_path"
+          return 0
+        fi
+        if openssl x509 -inform DER -in "$input_path" -noout >/dev/null 2>&1; then
+          openssl x509 -inform DER -in "$input_path" -out "$output_path"
+          return 0
+        fi
+        echo "ERROR: '$input_path' is not a valid X.509 certificate (PEM or DER)." >&2
+        return 1
+      }
 
       if [ -f /etc/ssl/certs/ca-certificates.crt ]; then
         cp /etc/ssl/certs/ca-certificates.crt /tmp/ci-ca-bundle.crt
@@ -25,13 +67,15 @@ include:
       fi
       if [ -n "${LOCAL_INTERMEDIATE_CA_CERT_FILE:-}" ] && [ -f "${LOCAL_INTERMEDIATE_CA_CERT_FILE}" ]; then
         echo "Appending intermediate CA: ${LOCAL_INTERMEDIATE_CA_CERT_FILE}"
+        normalize_cert "${LOCAL_INTERMEDIATE_CA_CERT_FILE}" /tmp/local-intermediate.pem
         printf '\n' >> /tmp/ci-ca-bundle.crt
-        cat "${LOCAL_INTERMEDIATE_CA_CERT_FILE}" >> /tmp/ci-ca-bundle.crt
+        cat /tmp/local-intermediate.pem >> /tmp/ci-ca-bundle.crt
       fi
       if [ -n "${LOCAL_ROOT_CA_CERT_FILE:-}" ] && [ -f "${LOCAL_ROOT_CA_CERT_FILE}" ]; then
         echo "Appending root CA: ${LOCAL_ROOT_CA_CERT_FILE}"
+        normalize_cert "${LOCAL_ROOT_CA_CERT_FILE}" /tmp/local-root.pem
         printf '\n' >> /tmp/ci-ca-bundle.crt
-        cat "${LOCAL_ROOT_CA_CERT_FILE}" >> /tmp/ci-ca-bundle.crt
+        cat /tmp/local-root.pem >> /tmp/ci-ca-bundle.crt
       fi
       for runner_ca in \
           /usr/local/share/ca-certificates/ca-cert-ca.pem \
@@ -44,7 +88,42 @@ include:
           break
         fi
       done
-      echo "CA bundle ready: /tmp/ci-ca-bundle.crt ($(wc -l < /tmp/ci-ca-bundle.crt) lines)"
+
+      # De-duplicate EXACT duplicate certs (same sha256 fingerprint) only.
+      # Do NOT dedup by subject_hash: a re-issued intermediate (same subject +
+      # key, new serial) MUST coexist with the old one — OpenSSL matches the
+      # leaf's AKI serial against the issuer's serial, so both versions are
+      # needed while old leaf certs are still in use.
+      awk 'BEGIN{inb=0; buf=""; n=0}
+        /-----BEGIN CERTIFICATE-----/{inb=1; buf=$0"\n"; next}
+        inb{buf=buf $0"\n"}
+        /-----END CERTIFICATE-----/{inb=0; n++; f="/tmp/ci-cert-"n".pem"; printf "%s",buf > f; buf=""}
+        END{}
+      ' /tmp/ci-ca-bundle.crt
+
+      rm -f /tmp/ci-ca-bundle.new
+      : > /tmp/ci-ca-bundle.new
+      declare -A seen=()
+      for f in /tmp/ci-cert-*.pem; do
+        [ -s "$f" ] || continue
+        fp="$(openssl x509 -in "$f" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2 || echo bad)"
+        if [ "$fp" != bad ] && [ -z "${seen[$fp]:-}" ]; then
+          seen[$fp]=1
+          cat "$f" >> /tmp/ci-ca-bundle.new
+        elif [ "$fp" = bad ]; then
+          echo "WARNING: dropping invalid cert block $f from bundle" >&2
+        else
+          echo "Dedup: dropping exact-duplicate cert (sha256=${fp:0:16}...) from $f" >&2
+        fi
+      done
+      rm -f /tmp/ci-cert-*.pem
+      mv /tmp/ci-ca-bundle.new /tmp/ci-ca-bundle.crt
+      echo "CA bundle ready (dedup): /tmp/ci-ca-bundle.crt ($(grep -c -- '-----BEGIN CERTIFICATE-----' /tmp/ci-ca-bundle.crt) certs)"
+
+      export SSL_CERT_FILE=/tmp/ci-ca-bundle.crt
+      export AWS_CA_BUNDLE=/tmp/ci-ca-bundle.crt
+      export GIT_SSL_CAINFO=/tmp/ci-ca-bundle.crt
+      export CURL_CA_BUNDLE=/tmp/ci-ca-bundle.crt
 
       if [ -n "${SOPS_AGE_KEY:-}" ]; then
         umask 077
@@ -99,6 +178,8 @@ include:
 
       git config --global --add safe.directory "${CI_PROJECT_DIR}"
       mkdir -p "${HOME}/.terraform.d/plugins"
+    # IAM Roles Anywhere: configure credential_process (no-op unless AWS_RA_ENABLED=true).
+    - !reference [.iac_template_aws_ra_init, script]
 
 # Shared plan-notes publishing helper.
 # Usage: post_plan_note preview|main
@@ -113,6 +194,25 @@ include:
 .iac-plan-notes:
   script:
     - |
+      # Helper: run curl and on failure, print HTTP status + truncated body.
+      # Usage: _curl_or_warn "warning message" <curl args...>
+      _curl_or_warn() {
+        local warn_msg="$1"; shift
+        local resp_file err_file code
+        resp_file="$(mktemp)"
+        err_file="$(mktemp)"
+        code="$(curl -sS -o "${resp_file}" -w '%{http_code}' "$@" 2>"${err_file}")" || true
+        case "${code}" in
+          200|201|204) rm -f "${resp_file}" "${err_file}"; return 0 ;;
+        esac
+        echo "WARNING: ${warn_msg} (non-fatal)"
+        echo "  HTTP status: ${code}"
+        echo "  curl stderr: $(head -c 500 "${err_file}" 2>/dev/null)"
+        echo "  Response: $(head -c 500 "${resp_file}" 2>/dev/null)"
+        rm -f "${resp_file}" "${err_file}"
+        return 0
+      }
+
       post_plan_note() {
         local mode="${1:-preview}"
 
@@ -175,6 +275,23 @@ include:
           done
         } > "${note_file}"
 
+        # Append the iam-policy-autopilot suggestions to the SAME single
+        # advisory MR note (preview only; main/apply don't ship policies yet).
+        # Gated by IAM_POLICY_AUTOPILOT_TO_MR_COMMENT; the artifacts are always
+        # generated either way.
+        if [ "${mode}" = "preview" ]; then
+          if [ "${IAM_POLICY_AUTOPILOT_TO_MR_COMMENT:-true}" = "true" ]; then
+            render_iam_policies_md "${REPORT_ROOT}" "${note_file}" || true
+          else
+            echo "NOTE: IAM policies NOT appended to the MR comment"
+            echo "      (IAM_POLICY_AUTOPILOT_TO_MR_COMMENT=${IAM_POLICY_AUTOPILOT_TO_MR_COMMENT:-});"
+            echo "      generated policies remain in the job artifacts under reports/."
+          fi
+        else
+          echo "NOTE: iam-policy-autopilot policies are MR-preview-only artifacts;"
+          echo "      not appended to the deployable plan commit comment."
+        fi
+
         # stay under the ~1 MB notes API limit
         if [ "$(wc -c < "${note_file}")" -gt 900000 ]; then
           head -c 900000 "${note_file}" > "${note_file}.tmp"
@@ -193,11 +310,11 @@ include:
             curl --silent --request DELETE --header "PRIVATE-TOKEN: ${GITLAB_API_TOKEN}" \
               "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/merge_requests/${CI_MERGE_REQUEST_IID}/notes/${id}" || true
           done
-          curl --silent --fail --request POST \
+          _curl_or_warn "failed to post plan note to MR" \
+            --request POST \
             --header "PRIVATE-TOKEN: ${GITLAB_API_TOKEN}" \
             "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/merge_requests/${CI_MERGE_REQUEST_IID}/notes" \
-            --data-urlencode "body@${note_file}" \
-            || echo "WARNING: failed to post plan note to MR (non-fatal)"
+            --data-urlencode "body@${note_file}"
         else
           # main mode: pipelines/jobs have NO notes API and no job-summary
           # surface in GitLab (CI_JOB_SUMMARY is GitHub Actions only).
@@ -216,11 +333,11 @@ include:
             if [ "${already:-0}" -gt 0 ]; then
               echo "Commit comment for this pipeline already exists; skipping."
             else
-              curl --silent --fail --request POST \
+              _curl_or_warn "failed to post plan comment on commit" \
+                --request POST \
                 --header "PRIVATE-TOKEN: ${GITLAB_API_TOKEN}" \
                 "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/repository/commits/${CI_COMMIT_SHA}/comments" \
-                --data-urlencode "note@${note_file}" \
-                || echo "WARNING: failed to post plan comment on commit (non-fatal)"
+                --data-urlencode "note@${note_file}"
             fi
           fi
 
@@ -232,11 +349,60 @@ include:
         fi
       }
 
+# Renders the per-stack iam-policy-autopilot output (generated by
+# plan-mr-preview) as markdown. Appended to the single advisory MR plan note
+# by post_plan_note preview — no extra GitLab API calls. Kept separate from
+# .iac-plan-notes because the deployable plan-main/apply flow does not ship
+# generated policies yet. The note JSON is pretty (the .iam-policies.json
+# artifact is saved from the --pretty run), so no re-format is needed here.
+# Usage: render_iam_policies_md <report_root> <output_md_file>
+.iac-plan-iam-policies:
+  script:
+    - |
+      render_iam_policies_md() {
+        local report_root="$1" out_file="$2" f policy_count
+        local found=0
+        for f in "${report_root}"/*.iam-policies.json; do
+          [ -s "$f" ] && found=1 && break
+        done
+        [ "$found" -eq 0 ] && return 0
+        {
+          echo
+          echo "## 🔐 IAM policies suggested by iam-policy-autopilot (advisory)"
+          echo "_Least-privilege identity-policy suggestions derived from each stack's \`terraform show -json\` plan._"
+          echo "_Best-effort — review before use; \`Warnings\` flag statements that fell back to a \`\"Resource\": \"*\"\` wildcard._"
+          echo
+          for f in "${report_root}"/*.iam-policies.json; do
+            [ -s "$f" ] || continue
+            # Total statement count across all generated policies ('?' when the
+            # file isn't the expected JSON shape; e.g. tool failure kept || true).
+            policy_count="$(jq '[.Policies // [] | .[] | (.Policy.Statement // []) | length] | add // 0' "$f" 2>/dev/null || echo '?')"
+            [ -n "${policy_count}" ] || policy_count="?"
+            echo "<details><summary>$(basename "$f" .iam-policies.json) — ${policy_count} statement(s)</summary>"
+            echo
+            echo '```json'
+            cat "$f"
+            echo '```'
+            echo
+            echo "</details>"
+            # Anchor the closing tag in its own paragraph. GitLab does not
+            # always break a fence-then-HTML-tag sequence, and (since the
+            # artifact's trailing newline is stripped by $(...)/echo) this
+            # also guarantees the trailing </details> is never glued to the
+            # closing ``` fence. '--' = horizontal rule / signature break.
+            echo
+            echo '-- '
+            echo
+          done
+        } >> "${out_file}"
+      }
+
 plan-mr-preview:
   extends:
     - .iac_template_plan_base
   script:
     - !reference [.iac-plan-notes, script]
+    - !reference [.iac-plan-iam-policies, script]
     - |
       set -euo pipefail
       cd ${TF_ROOT}
@@ -248,6 +414,9 @@ plan-mr-preview:
       echo "at the 'plan-main' task after merging to the main branch."
       echo "2) tf-summarize and tfplan2md are the tools to detect changes"
       echo "They are best effort and may have bugs."
+      echo "3) iam-policy-autopilot derives advisory least-privilege IAM policies"
+      echo "from each stack's 'terragrunt show -json' plan. Also best effort:"
+      echo "review before use."
       echo "================================================================"
 
       if ! command -v openssl >/dev/null 2>&1; then
@@ -268,6 +437,22 @@ plan-mr-preview:
         echo "WARNING: tfplan2md was not found. Markdown plan rendering will be skipped."
       fi
 
+      # iam-policy-autopilot: baked into ${IAC_PIPELINE_IMAGE} at
+      # /usr/local/bin/iam-policy-autopilot (atlantis-custom-image). Advisory
+      # only: missing binary or tool failure must never fail the plan.
+      IAM_POLICY_AUTOPILOT_BIN=""
+      if [ -x /usr/local/bin/iam-policy-autopilot ]; then
+        IAM_POLICY_AUTOPILOT_BIN="/usr/local/bin/iam-policy-autopilot"
+      elif command -v iam-policy-autopilot >/dev/null 2>&1; then
+        IAM_POLICY_AUTOPILOT_BIN="$(command -v iam-policy-autopilot)"
+      fi
+      if [ -n "${IAM_POLICY_AUTOPILOT_BIN}" ]; then
+        # Persist the opt-out choice for this container (belt-and-braces on top
+        # of DISABLE_IAM_POLICY_AUTOPILOT_TELEMETRY=true, which outranks it).
+        "${IAM_POLICY_AUTOPILOT_BIN}" telemetry --disable >/dev/null 2>&1 || true
+      else
+        echo "NOTE: iam-policy-autopilot not found; IAM policy generation will be skipped."
+      fi
       PLAN_ROOT="${TF_ROOT}/.terragrunt-plans"
       rm -rf "${PLAN_ROOT}"
       mkdir -p "${PLAN_ROOT}" "${PLAN_ROOT}/reports"
@@ -288,6 +473,9 @@ plan-mr-preview:
         module_summary_md_file="${PLAN_ROOT}/reports/${safe_module_name}.tf-summarize.md"
         module_summary_html_file="${PLAN_ROOT}/reports/${safe_module_name}.tf-summarize.html"
         module_markdown_file="${PLAN_ROOT}/reports/${safe_module_name}.plan.md"
+        module_policies_file="${PLAN_ROOT}/reports/${safe_module_name}.iam-policies.json"
+        module_policies_compact_file="${PLAN_ROOT}/reports/${safe_module_name}.iam-policies.compact.json"
+        module_policies_stderr_file="${PLAN_ROOT}/reports/${safe_module_name}.iam-policies.stderr.txt"
 
         echo "Planning stack: ${rel_module_dir}"
         (
@@ -353,7 +541,41 @@ plan-mr-preview:
             fi
           fi
 
-          rm -f "${module_show_file}" "${module_plan_file}"
+          if [ -n "${IAM_POLICY_AUTOPILOT_BIN}" ]; then
+            "${IAM_POLICY_AUTOPILOT_BIN}" telemetry --disable >/dev/null 2>&1 || true
+            echo "--- iam-policy-autopilot (${rel_module_dir}) ---"
+            : > "${module_policies_stderr_file}"
+            # Artifacts: run first into a temp buffer; keep it as the raw
+            # .iam-policies.json artifact ONLY when stdout really is the JSON
+            # envelope ({ ... }). Failures (|| true) would otherwise leave a
+            # non-JSON blob that jq/abs the note renderer would choke on.
+            ipa_tmp="$(mktemp)"
+            "${IAM_POLICY_AUTOPILOT_BIN}" generate-policies "${module_show_file}" --pretty \
+              > "${ipa_tmp}" 2>> "${module_policies_stderr_file}" || true
+            if [ -s "${ipa_tmp}" ] && [ "$(head -c 1 "${ipa_tmp}")" = "{" ]; then
+              # Note artifact = pretty JSON -> the MR note (and this file)
+              # render with newlines. Compact copy kept alongside for
+              # storage/processing.
+              mv "${ipa_tmp}" "${module_policies_file}"
+              jq -c '.' "${module_policies_file}" > "${module_policies_compact_file}" 2>/dev/null || rm -f "${module_policies_compact_file}"
+            else
+              rm -f "${ipa_tmp}" "${module_policies_file}" "${module_policies_compact_file}"
+              echo "NOTE: iam-policy-autopilot produced no JSON artifact for ${rel_module_dir}; see ${module_policies_stderr_file}" >&2
+            fi
+            # Console: pretty run, stdout straight to the job log (pure JSON;
+            # logs go to stderr). Gated by IAM_POLICY_AUTOPILOT_APPEND_TO_JOB_LOG
+            # (set "false" to keep the job log small on large diffs).
+            if [ "${IAM_POLICY_AUTOPILOT_APPEND_TO_JOB_LOG:-true}" = "true" ]; then
+              "${IAM_POLICY_AUTOPILOT_BIN}" generate-policies "${module_show_file}" --pretty \
+                2>> "${module_policies_stderr_file}" || true
+            else
+              echo "NOTE: IAM policies NOT echoed to the job log"
+              echo "      (IAM_POLICY_AUTOPILOT_APPEND_TO_JOB_LOG=${IAM_POLICY_AUTOPILOT_APPEND_TO_JOB_LOG:-})."
+            fi
+            [ -s "${module_policies_stderr_file}" ] || rm -f "${module_policies_stderr_file}"
+          fi
+
+          rm -f "${module_plan_file}" "${module_show_file}"
         )
       done <<< "${CHANGED_STACKS}"
 
@@ -704,6 +926,8 @@ apply:
         echo "SOPS age key: NOT configured (SOPS_AGE_KEY/SOPS_AGE_KEY_FILE missing)"
       fi
       mkdir -p "${HOME}/.terraform.d/plugins"
+    # IAM Roles Anywhere: configure credential_process (no-op unless AWS_RA_ENABLED=true).
+    - !reference [.iac_template_aws_ra_init, script]
   script:
     - |
       set -euo pipefail

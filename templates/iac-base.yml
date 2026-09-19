@@ -28,6 +28,10 @@ variables:
   VAULT_ID_TOKEN_AUDIENCE: ""
   VAULT_AUTH_ROLE: ""
   VAULT_AUTH_PATH: "jwt"
+  # IAM Roles Anywhere: set to "true" in a consumer's .gitlab-ci.yml to enable the
+  # aws_signing_helper credential_process (see .iac_template_aws_ra_init below).
+  # Default "false" -> the RA before_script is a no-op for consumers that don't use it.
+  AWS_RA_ENABLED: "false"
 
 .iac_template_local_ca_init:
   before_script:
@@ -37,6 +41,14 @@ variables:
       normalize_cert() {
         input_path="$1"
         output_path="$2"
+        # Multi-cert PEM bundle (e.g. old + re-issued intermediate): copy as-is.
+        # openssl x509 would only keep the FIRST cert, dropping the rest.
+        local count
+        count="$(grep -c -- '-----BEGIN CERTIFICATE-----' "$input_path" 2>/dev/null || echo 0)"
+        if [ "${count:-0}" -gt 1 ]; then
+          cp -f "$input_path" "$output_path"
+          return 0
+        fi
         if openssl x509 -in "$input_path" -noout >/dev/null 2>&1; then
           openssl x509 -in "$input_path" -out "$output_path" >/dev/null 2>&1 || cp -f "$input_path" "$output_path"
           return 0
@@ -65,3 +77,75 @@ variables:
       export SSL_CERT_FILE="${CUSTOM_CA_BUNDLE}"
       export CURL_CA_BUNDLE="${CUSTOM_CA_BUNDLE}"
       git config --global http.sslCAInfo "${CUSTOM_CA_BUNDLE}" || true
+
+# IAM Roles Anywhere: configure a credential_process (aws_signing_helper) so
+# terragrunt/tofu can assume the IAM role with short-lived STS credentials.
+#
+# Gated behind AWS_RA_ENABLED (default "false" in the variables block above).
+# Consumers that use AWS RA set AWS_RA_ENABLED: "true" in their .gitlab-ci.yml,
+# plus AWS_RA_TRUST_ANCHOR_ARN / AWS_RA_PROFILE_ARN / AWS_RA_ROLE_ARN /
+# AWS_RA_REGION, and provide:
+#   AWS_RA_CLIENT_CERT_FILE  - file-type (protected) CI/CD variable: the runner x509 cert
+#   AWS_RA_CLIENT_KEY_BASE64 - masked (protected) CI/CD variable: base64 of the private
+#                              key PEM (base64 is single-line, so it CAN be masked,
+#                              unlike the multi-line PEM). Decoded to a key file at runtime.
+#
+# Referenced from the plan/apply before_scripts via:
+#   - !reference [.iac_template_aws_ra_init, script]
+.iac_template_aws_ra_init:
+  script:
+    - |
+      if [ "${AWS_RA_ENABLED:-false}" != "true" ]; then
+        echo "AWS Roles Anywhere: disabled (AWS_RA_ENABLED != true); skipping"
+      else
+        # Explicitly opted in -> fail fast if anything is missing.
+        if [ -z "${AWS_RA_TRUST_ANCHOR_ARN:-}" ]; then
+          echo "ERROR: AWS_RA_ENABLED=true but AWS_RA_TRUST_ANCHOR_ARN is not set" >&2
+          exit 1
+        fi
+        if [ -z "${AWS_RA_PROFILE_ARN:-}" ]; then
+          echo "ERROR: AWS_RA_ENABLED=true but AWS_RA_PROFILE_ARN is not set" >&2
+          exit 1
+        fi
+        if [ -z "${AWS_RA_ROLE_ARN:-}" ]; then
+          echo "ERROR: AWS_RA_ENABLED=true but AWS_RA_ROLE_ARN is not set" >&2
+          exit 1
+        fi
+        if [ -z "${AWS_RA_CLIENT_CERT_FILE:-}" ] || [ ! -f "${AWS_RA_CLIENT_CERT_FILE}" ]; then
+          echo "ERROR: AWS_RA_ENABLED=true but AWS_RA_CLIENT_CERT_FILE missing/not a file: '${AWS_RA_CLIENT_CERT_FILE:-}'" >&2
+          exit 1
+        fi
+        if [ -z "${AWS_RA_CLIENT_KEY_BASE64:-}" ]; then
+          echo "ERROR: AWS_RA_ENABLED=true but AWS_RA_CLIENT_KEY_BASE64 is not set" >&2
+          exit 1
+        fi
+        if ! command -v aws_signing_helper >/dev/null 2>&1; then
+          echo "ERROR: aws_signing_helper not found in PATH (required for AWS_RA_ENABLED=true)" >&2
+          exit 1
+        fi
+        umask 077
+        mkdir -p "${HOME}/.aws"
+        # Decode the base64'd private key to a file (mode 600 via umask 077).
+        # -w0 = no line wrapping on encode; base64 input tolerates none.
+        AWS_RA_KEY_PATH="${CI_PROJECT_DIR}/.aws-ra-client.key"
+        printf '%s' "${AWS_RA_CLIENT_KEY_BASE64}" | base64 -d > "${AWS_RA_KEY_PATH}"
+        chmod 400 "${AWS_RA_KEY_PATH}"
+        # Sanity: the decoded key must look like a PEM private key.
+        if ! grep -q -- "-----BEGIN" "${AWS_RA_KEY_PATH}" || ! grep -q -- "PRIVATE KEY" "${AWS_RA_KEY_PATH}"; then
+          echo "ERROR: decoded AWS_RA_CLIENT_KEY_BASE64 does not look like a PEM private key" >&2
+          echo "Hint: encode with: base64 -w0 runner.key.pem" >&2
+          rm -f "${AWS_RA_KEY_PATH}"
+          exit 1
+        fi
+        # ~/.aws/config does NOT expand env vars -> bake literal paths/ARNs in.
+        {
+          echo "[profile ra]"
+          echo "region = ${AWS_RA_REGION:-us-east-2}"
+          echo "output = json"
+          echo "credential_process = /usr/local/bin/aws_signing_helper credential-process --certificate ${AWS_RA_CLIENT_CERT_FILE} --private-key ${AWS_RA_KEY_PATH} --trust-anchor-arn ${AWS_RA_TRUST_ANCHOR_ARN} --profile-arn ${AWS_RA_PROFILE_ARN} --role-arn ${AWS_RA_ROLE_ARN} --session-duration 3600"
+        } > "${HOME}/.aws/config"
+        chmod 600 "${HOME}/.aws/config"
+        export AWS_PROFILE=ra
+        export AWS_REGION="${AWS_RA_REGION:-us-east-2}"
+        echo "AWS Roles Anywhere: credential_process configured (profile ra, region ${AWS_RA_REGION:-us-east-2}); key decoded to ${AWS_RA_KEY_PATH}"
+      fi

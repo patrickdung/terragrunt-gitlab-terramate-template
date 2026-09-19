@@ -29,3 +29,8 @@ root-dir-of-repo/               # This repo
 - Do not attempt to delete or fix other codes that is not related and/or not broken.
 - If serious problems in other parts were found, prompt or give suggestions
 - Try to keep the coding style of current repo.
+
+## 3) GitLab linting
+* For linting of any gitlab yaml files:
+** Please use command like this (it's python and installed in my user's pip)
+check-jsonschema --builtin-schema vendor.gitlab-ci --data-transform gitlab-ci --regex-variant nonunicode gitlab-file.yml

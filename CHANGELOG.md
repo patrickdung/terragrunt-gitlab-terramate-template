@@ -2,7 +2,144 @@
 
 All notable changes to this template repository are documented in this file.
 
-## [2026-08-30]
+## [v0.0.7] - 2026-09-07
+
+### Added (iam-policy-autopilot switches + review fixes)
+
+- **`templates/iac-plan-apply.yml`** — new plan-base variable
+  **`IAM_POLICY_AUTOPILOT_TO_MR_COMMENT`** (default `"true"`). The
+  iam-policy-autopilot policies are **always** generated and kept as
+  `plan-mr-preview` artifacts
+  (`.terragrunt-plans/reports/<stack>.iam-policies.json` + a compact
+  `<stack>.iam-policies.compact.json` copy). Set it to `"false"` in a consumer
+  repo to **skip appending the policies to the MR plan note** — useful when
+  many resources change and the generated policies would make the MR comment
+  very large. A `NOTE:` line in the job log records when the append was
+  skipped. `post_plan_note main` and `apply` are unchanged (policies remain
+  MR-preview-only).
+- **`templates/iac-plan-apply.yml`** — new plan-base variable
+  **`IAM_POLICY_AUTOPILOT_APPEND_TO_JOB_LOG`** (default `"true"`). The pretty
+  per-stack JSON is also echoed to the `plan-mr-preview` **job log** (the job
+  trace, not the MR comment); set it to `"false"` to keep the log small when
+  many resources change. The artifacts and the optional MR comment are
+  unaffected. A `NOTE:` line records the skip.
+
+### Changed
+
+- **`templates/iac-plan-apply.yml`** — the `.iam-policies.json` artifact is now
+  saved from the **`--pretty`** run (previously the compact flag-less run), so
+  the JSON embedded in the MR note renders with newlines instead of one long
+  line; a compact `<stack>.iam-policies.compact.json` copy (`jq -c`) is kept
+  alongside for storage/processing.
+- **`templates/iac-plan-apply.yml`** — `render_iam_policies_md` now appends a
+  `-- ` signature line after each `</details>` so GitLab anchors the closing
+  tag in its own paragraph (the JSON fenced block could otherwise swallow the
+  trailing `</details>`, and the artifact's trailing newline is stripped by
+  the shell).
+- **`README.md` / `design/iac-plan-apply.md`** — documented the
+  `IAM_POLICY_AUTOPILOT_TO_MR_COMMENT` and
+  `IAM_POLICY_AUTOPILOT_APPEND_TO_JOB_LOG` switches, the pretty-artifact
+  change, and the `-- ` note anchor.
+
+## [v0.0.6] - 2026-09-07
+
+### Added (iam-policy-autopilot integration — MR preview only)
+
+- **`templates/iac-plan-apply.yml`** — `plan-mr-preview` now runs
+  [`iam-policy-autopilot`](https://github.com/awslabs/iam-policy-autopilot)
+  per changed stack, right after the summarization CLIs (tf-summarize /
+  tfplan2md). It feeds the existing
+  `terragrunt show -json` output (`<stack>.show.json`) to
+  `generate-policies` to derive **advisory least-privilege IAM identity
+  policies** from the Terraform plan.
+  - **Console/note:** `generate-policies <stack>.show.json --pretty` is printed
+    to the job log (logs go to stderr, so stdout stays pure JSON).
+  - **Artifacts:** a `generate-policies <stack>.show.json --pretty` run is saved
+    as `.terragrunt-plans/reports/<stack>.iam-policies.json` — only when stdout
+    really is the JSON envelope; a compact `<stack>.iam-policies.compact.json`
+    copy is kept alongside; on failure the file is discarded and the
+    diagnostics are kept in `<stack>.iam-policies.stderr.txt` (kept only when
+    non-empty). `*.iam-policies.json` files never mix with the
+    `plan-main-save-plan-summary` long-lived artifact (that job only re-saves
+    `reports/`, and the preview reports stay in the preview artifact).
+  - **MR note:** a new hidden template `.iac-plan-iam-policies` provides
+    `render_iam_policies_md`, which `post_plan_note preview` appends to the
+    **same single self-updating advisory MR note** as a
+    `## 🔐 IAM policies suggested by iam-policy-autopilot (advisory)` section —
+    per-stack collapsed `<details>` blocks with ` ```json ` fenced policies and
+    a `jq`-computed statement count, plus a hint that `Warnings` flag
+    statements that fell back to `"Resource": "*"`, and a `--` signature
+    after each `</details>` (paragraph anchor). The `.iam-policies.json`
+    artifact is the `--pretty` output so the note renders with newlines; a
+    `<stack>.iam-policies.compact.json` copy is kept alongside. No extra
+    GitLab API calls; inherits the note's 900 kB truncation + delete/repost
+    idempotency.
+  - **Telemetry:** `DISABLE_IAM_POLICY_AUTOPILOT_TELEMETRY: "true"` is exported
+    (env var has the highest precedence — beats the persisted
+    `~/.iam-policy-autopilot/config.json` choice), plus a best-effort
+    `iam-policy-autopilot telemetry --disable` once per job and per stack as a
+    persisted fallback. No telemetry is sent.
+  - The binary is expected in the pipeline image at
+    `/usr/local/bin/iam-policy-autopilot` (`${IAC_PIPELINE_IMAGE}`, see
+    `atlantis-custom-image`); a `PATH` fallback is also probed. When absent,
+    only a skip NOTE is printed — the plan is never failed. All invocations are
+    `|| true` so a tool failure can never fail the plan job.
+  - `plan-main` / `apply` are **unchanged**: `post_plan_note main` logs that
+    the policies are MR-preview-only and does not append them to the
+    deployable-plan commit comment. The per-stack `.show.json` is now removed
+    at the end of the loop (after policy generation) instead of right after
+    tfplan2md.
+
+### Changed
+
+- **`templates/iac-plan-apply.yml`** — new plan-base variable
+  `DISABLE_IAM_POLICY_AUTOPILOT_TELEMETRY: "true"` (see above). Override to
+  `"false"` in a consumer repo only if you explicitly want telemetry.
+- **`README.md`** / **`design/iac-plan-apply.md`** — documented
+  `iam-policy-autopilot` as a required image tool, the MR-preview policy
+  generation flow, the advisory/never-fails semantics, the telemetry opt-out
+  variable, and the planned `--region`/`--account` follow-up (region/account
+  extraction from Terragrunt inputs).
+
+## [2026-09-06]
+
+### Added (IAM Roles Anywhere support)
+
+- **`templates/iac-base.yml`** — new `.iac_template_aws_ra_init` anchor.
+  Writes a `[profile ra]` section to `~/.aws/config` with a `credential_process`
+  pointing to `aws_signing_helper` (Roles Anywhere credential helper, installed in
+  the pipeline image at `/usr/local/bin/aws_signing_helper`). At runtime,
+  Terraform/Terragrunt picks it up via `AWS_PROFILE=ra`, obtaining short-lived
+  STS credentials without any static AWS access keys.
+
+- **`templates/iac-base.yml`** — new `AWS_RA_ENABLED` variable (default
+  `"false"`). The anchor is **a complete no-op** unless the consumer repo sets
+  `AWS_RA_ENABLED: "true"` in its own `.gitlab-ci.yml`. Other consumers are
+  completely unaffected.
+
+- **`templates/iac-plan-apply.yml`** — added `- !reference
+  [.iac_template_aws_ra_init, script]` to `.iac_template_plan_base`
+  before_script (covers `plan-main` + `plan-mr-preview`) and to the `apply`
+  job's before_script. Both fail fast with a clear `ERROR:` message if any
+  `AWS_RA_*` variable is set but incomplete/missing.
+
+- **New optional CI/CD variables** (all prefixed `AWS_RA_*`):
+
+  | Variable | Type | Protected | Masked | Purpose |
+  |----------|------|-----------|--------|---------|
+  | `AWS_RA_ENABLED` | env var | — | — | Set to `"true"` in consumer `.gitlab-ci.yml` to activate RA |
+  | `AWS_RA_TRUST_ANCHOR_ARN` | env var | — | — | Roles Anywhere trust anchor ARN (non-secret, safe in git) |
+  | `AWS_RA_PROFILE_ARN` | env var | — | — | Roles Anywhere profile ARN (non-secret, safe in git) |
+  | `AWS_RA_ROLE_ARN` | env var | — | — | IAM role ARN to assume (non-secret, safe in git) |
+  | `AWS_RA_REGION` | env var | — | — | AWS region (default `us-east-2`) |
+  | `AWS_RA_CLIENT_CERT_FILE` | File | ✅ | — | Runner x509 client cert (public material) |
+  | `AWS_RA_CLIENT_KEY_BASE64` | Variable | ✅ | ✅ | `base64 -w0` of the private key PEM |
+
+  `AWS_RA_CLIENT_KEY_BASE64` is used instead of a file because a multi-line PEM
+  private key **cannot be masked** as a GitLab CI/CD variable. Base64 is a
+  single-line string so it both masks correctly and decodes back with `base64 -d`
+  at runtime. The decoded key is written to `${CI_PROJECT_DIR}/.aws-ra-client.key`
+  (mode 400) and is removed if it fails a PEM sanity check.
 
 ### Added
 
