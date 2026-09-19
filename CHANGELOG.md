@@ -2,7 +2,7 @@
 
 All notable changes to this template repository are documented in this file.
 
-## [v0.0.7] - 2026-09-07
+## 2026-09-07
 
 ### Added (iam-policy-autopilot switches + review fixes)
 
@@ -41,7 +41,7 @@ All notable changes to this template repository are documented in this file.
   `IAM_POLICY_AUTOPILOT_APPEND_TO_JOB_LOG` switches, the pretty-artifact
   change, and the `-- ` note anchor.
 
-## [v0.0.6] - 2026-09-07
+## 2026-09-07
 
 ### Added (iam-policy-autopilot integration — MR preview only)
 
