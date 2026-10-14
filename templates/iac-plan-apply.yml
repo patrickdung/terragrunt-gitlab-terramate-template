@@ -457,7 +457,21 @@ plan-mr-preview:
       rm -rf "${PLAN_ROOT}"
       mkdir -p "${PLAN_ROOT}" "${PLAN_ROOT}/reports"
 
-      CHANGED_STACKS="$(terramate list --changed)"
+      # Fail fast on dependency cycles or invalid stack config: terramate
+      # exits non-zero with a "cycle detected" error when the Terragrunt
+      # dependency DAG is not acyclic.
+      if ! terramate list --run-order >/dev/null 2>&1; then
+        echo "ERROR: terramate could not build the stack dependency graph (cycle detected or invalid stack config)."
+        echo "Run 'terramate list --run-order' locally to see the full error."
+        exit 1
+      fi
+
+      # ${IAC_TERRAMATE_PLAN_EXTRA_FLAGS} defaults to
+      # "--include-all-dependents --run-order": re-plan stacks that depend on
+      # a changed stack (their inputs may change) and iterate in dependency
+      # (DAG) execution order so the per-stack loop plans dependencies
+      # before dependents.
+      CHANGED_STACKS="$(terramate list --changed ${IAC_TERRAMATE_PLAN_EXTRA_FLAGS})"
       if [ -z "${CHANGED_STACKS}" ]; then
         echo "No changed stacks detected. Nothing to plan."
         exit 0
@@ -638,7 +652,22 @@ plan-main:
       echo "They are best effort and may have bugs."
       echo "================================================================"
 
-      CHANGED_STACKS="$(terramate list --changed)"
+      # Fail fast on dependency cycles or invalid stack config: terramate
+      # exits non-zero with a "cycle detected" error when the Terragrunt
+      # dependency DAG is not acyclic.
+      if ! terramate list --run-order >/dev/null 2>&1; then
+        echo "ERROR: terramate could not build the stack dependency graph (cycle detected or invalid stack config)."
+        echo "Run 'terramate list --run-order' locally to see the full error."
+        exit 1
+      fi
+
+      # ${IAC_TERRAMATE_PLAN_EXTRA_FLAGS} defaults to
+      # "--include-all-dependents --run-order": re-plan stacks that depend on
+      # a changed stack (their inputs may change) and iterate in dependency
+      # (DAG) execution order so the per-stack loop plans dependencies
+      # before dependents. The manifest written below therefore lists
+      # stacks in DAG order, and the apply job iterates it in that order.
+      CHANGED_STACKS="$(terramate list --changed ${IAC_TERRAMATE_PLAN_EXTRA_FLAGS})"
       if [ -z "${CHANGED_STACKS}" ]; then
         echo "No changed stacks detected. Nothing to plan."
         exit 0
@@ -971,6 +1000,27 @@ apply:
       if [ ! -s "${MANIFEST_FILE}" ]; then
         echo "No changed stacks were planned. Nothing to apply."
         exit 0
+      fi
+
+      # Sanity check: plan-main writes the manifest in Terramate DAG
+      # execution order (--run-order), so dependencies are applied before
+      # dependents. Verify the manifest order matches the DAG order for the
+      # stacks it contains; warn (non-fatal) on mismatch so a future change
+      # to the plan job cannot silently break apply ordering.
+      if command -v terramate >/dev/null 2>&1; then
+        dag_order="$(terramate list --run-order 2>/dev/null || true)"
+        if [ -n "${dag_order}" ]; then
+          manifest_order="$(cut -d'|' -f1 "${MANIFEST_FILE}")"
+          expected_order="$(printf '%s\n' "${dag_order}" | grep -Fxf <(printf '%s\n' "${manifest_order}") || true)"
+          if [ "${manifest_order}" != "${expected_order}" ]; then
+            echo "WARNING: plan manifest order does not match Terramate DAG execution order."
+            echo "Manifest order: $(echo "${manifest_order}" | tr '\n' ' ')"
+            echo "DAG order:      $(echo "${expected_order}" | tr '\n' ' ')"
+            echo "Applying in manifest order anyway (plan-main wrote it); if apply fails on a dependency, re-plan."
+          else
+            echo "Manifest order matches Terramate DAG execution order."
+          fi
+        fi
       fi
 
       while IFS='|' read -r rel_module_dir module_plan_encrypted_file; do

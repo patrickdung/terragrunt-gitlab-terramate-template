@@ -24,6 +24,16 @@ variables:
   # TERRAFORM_VERSION: "1.12.2"
   IAC_PIPELINE_IMAGE: ""
   IAC_RESOURCE_GROUP: "terraform-state"
+  # Extra flags appended to `terramate list --changed` in the plan jobs
+  # (plan-mr-preview, plan-main). Default: include stacks that depend on a
+  # changed stack (so their plans are regenerated when upstream outputs may
+  # change) and sort the list in dependency (DAG) execution order, so the
+  # per-stack plan/apply loop processes dependencies before dependents.
+  # Terramate builds the DAG from Terragrunt `dependency` blocks found in
+  # each stack's root terragrunt.hcl (a proper root module with a
+  # `terraform { source = ... }` block). Set to "" in a consumer repo to
+  # restore the old behaviour (changed stacks only, path order).
+  IAC_TERRAMATE_PLAN_EXTRA_FLAGS: "--include-all-dependents --run-order"
   VAULT_ADDR: ""
   VAULT_ID_TOKEN_AUDIENCE: ""
   VAULT_AUTH_ROLE: ""

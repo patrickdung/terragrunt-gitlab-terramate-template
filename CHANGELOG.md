@@ -2,6 +2,45 @@
 
 All notable changes to this template repository are documented in this file.
 
+## 2026-10-14
+
+### Changed (stack dependency ordering — DAG-aware plan/apply)
+
+- **`templates/iac-base.yml`** — new global variable
+  `IAC_TERRAMATE_PLAN_EXTRA_FLAGS` (default
+  `"--include-all-dependents --run-order"`). Appended to
+  `terramate list --changed` in the plan jobs. Set to `""` in a consumer
+  repo to restore the old behaviour (changed stacks only, path order).
+- **`templates/iac-plan-apply.yml`** — `plan-mr-preview` and `plan-main` now
+  run `terramate list --changed ${IAC_TERRAMATE_PLAN_EXTRA_FLAGS}`:
+  - `--include-all-dependents` — if stack A changed, stacks that depend on
+    A (via Terragrunt `dependency` blocks) are also planned, because their
+    inputs may change.
+  - `--run-order` — the stack list is sorted in dependency (DAG) execution
+    order, so the per-stack plan loop processes dependencies before
+    dependents. `plan-main` writes `plan-manifest.txt` in this order.
+  - Both plan jobs fail fast on dependency cycles: a `terramate list
+    --run-order` sanity check aborts the job with a clear error before any
+    planning starts.
+- **`templates/iac-plan-apply.yml`** — the `apply` job sanity-checks that
+  the manifest order matches `terramate list --run-order` filtered to the
+  manifest entries and warns (non-fatal) on mismatch. Apply iterates the
+  manifest in the order `plan-main` wrote it (DAG order), so dependencies
+  are applied before dependents.
+- **`design/iac-plan-apply.md`** — new "Stack dependency ordering (DAG)"
+  section documenting the DAG source (Terragrunt `dependency` blocks in each
+  stack's root `terragrunt.hcl`), the plan/apply ordering behaviour, the
+  toggle variable, and the consumer requirement for `mock_outputs` +
+  `mock_outputs_allowed_terraform_commands` (which **must include
+  `"show"`** — the plan loop runs `terragrunt show -json` right after
+  `terragrunt plan`, and `show` re-resolves dependency outputs too) on
+  dependencies that do not exist yet. Also documents that a first-time
+  deploy of a dependency chain takes one pipeline run per link (OpenTofu's
+  saved-plan variable mismatch check is by design; re-run the pipeline, do
+  not retry the apply job).
+- **`README.md`** — "Other aspects" now mentions DAG-ordered plan/apply and
+  the `mock_outputs` requirement for new dependent stacks.
+
 ## 2026-09-07
 
 ### Added (iam-policy-autopilot switches + review fixes)

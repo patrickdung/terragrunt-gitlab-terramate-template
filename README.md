@@ -4,11 +4,19 @@ This repository is the source of reusable GitLab CI templates for Terramate and 
 
 The root pipeline in [./.gitlab-ci.yml](./.gitlab-ci.yml) is the template repository's own integration pipeline. It consumes the exported files locally so changes to the shared YAML are exercised in this repository before other repositories adopt them.
 
+## How this template is created
+
+Most parts of the template is created using AI or AI assisted.
+Ideas, inputs and design decision are human controlled.
+
 ## How this template is designed
 
 This template is inspired by [TACOS](https://opentofu.org/docs/intro/tacos/) like Atlantis.
 In an ideal situation, use of TACOS like Atlantis, Digger is desirable.
 There are some use cases where the users want a pure GitLab CI solution for use with Terragrunt.
+At current stage, I think there still areas for improvement for this template.
+(e.g. DAG, resources dependency, plan/apply abort in mid-flight, how to resume,
+drifts due to mid-flight abort, etc.)
 
 So, in this template, it would:
 
@@ -50,6 +58,12 @@ what would be changed
     - After the apply task has run successfully, the Terraform plans (artifacts) would be deleted to prevent them to be re-run (accidentially)
 - Other aspects
   - Use of Terramate to detect what resources is being changed
+  - Stacks with Terragrunt `dependency` blocks are planned and applied in
+    dependency (DAG) order: if stack A changes, stacks that depend on A are
+    re-planned too, and dependencies are always applied before dependents.
+    New stacks that depend on not-yet-existing stacks must declare
+    `mock_outputs` + `mock_outputs_allowed_terraform_commands` in their
+    `dependency` blocks (see `design/iac-plan-apply.md`).
   - Security checking
   - I am using a self signed CA certificate for my homelabe environment. So, there would be settings for trusting the self signed CA certificate.
 
