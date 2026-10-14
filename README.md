@@ -44,7 +44,7 @@ what would be changed
     the plan. `plan-main` / `apply` do not generate or publish policies.
     Telemetry is disabled (see `DISABLE_IAM_POLICY_AUTOPILOT_TELEMETRY` under
     *Common Overrides*). The per-stack policies are always kept as artifacts;
-    set `IAM_POLICY_AUTOPILOT_TO_MR_COMMIT: "false"` to skip appending them to
+    set `IAM_POLICY_AUTOPILOT_TO_MR_COMMENT: "false"` to skip appending them to
     the MR note (e.g. when many resources change and the generated policies
     would make the MR comment huge) — see *Common Overrides*. The pretty JSON
     is also echoed to the job log (the job trace); set
@@ -218,7 +218,7 @@ These shared defaults can be overridden by caller repositories without editing t
   beats the persisted `~/.iam-policy-autopilot/config.json` choice. A
   best-effort `iam-policy-autopilot telemetry --disable` is also run in the
   plan job. Set to `"false"` only if you explicitly want telemetry.
-- `IAM_POLICY_AUTOPILOT_TO_MR_COMMIT` — defaults to `"true"`. The generated
+- `IAM_POLICY_AUTOPILOT_TO_MR_COMMENT` — defaults to `"true"`. The generated
   IAM policies are always kept as `plan-mr-preview` artifacts
   (`.terragrunt-plans/reports/<stack>.iam-policies.json`). Set to `"false"` to
   skip appending them to the MR plan note — useful when many resources change

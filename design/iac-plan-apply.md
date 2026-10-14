@@ -141,7 +141,7 @@ saved plans), not a bug. Consequences and the accepted operating procedure:
 | `IAC_TERRAMATE_PLAN_EXTRA_FLAGS` | Extra flags for `terramate list --changed` in the plan jobs. Default `"--include-all-dependents --run-order"` (re-plan dependents of changed stacks; iterate in DAG execution order). Set to `""` to restore changed-stacks-only, path-order behaviour. | Optional (default provided) |
 | `GITLAB_API_TOKEN` | Project or group access token (`api` scope, Maintainer/Owner role) used by `plan-mr-preview` to post the MR plan note, by `plan-main` to post the plan as a commit comment, and by `apply` to delete `plan-main` artifacts after a successful apply. If unset, note posting and artifact deletion are skipped (non-fatal). | Optional |
 | `DISABLE_IAM_POLICY_AUTOPILOT_TELEMETRY` | Defaults to `"true"` — opts out of iam-policy-autopilot telemetry. Highest precedence (beats the tool's persisted `~/.iam-policy-autopilot/config.json` choice); `telemetry --disable` is also run best-effort in the plan job. | Optional (default provided) |
-| `IAM_POLICY_AUTOPILOT_TO_MR_COMMIT` | Defaults to `"true"`. The generated IAM policies are always kept as `plan-mr-preview` artifacts; set to `"false"` to skip appending them to the MR plan note (large diffs -> huge MR comment). | Optional (default provided) |
+| `IAM_POLICY_AUTOPILOT_TO_MR_COMMENT` | Defaults to `"true"`. The generated IAM policies are always kept as `plan-mr-preview` artifacts; set to `"false"` to skip appending them to the MR plan note (large diffs -> huge MR comment). | Optional (default provided) |
 | `IAM_POLICY_AUTOPILOT_APPEND_TO_JOB_LOG` | Defaults to `"true"`. The pretty JSON is also echoed to the `plan-mr-preview` job log (the job trace, not the MR comment); set to `"false"` to keep the log small on large diffs. | Optional (default provided) |
 ## IAM policy generation from the plan (MR preview only)
 
@@ -182,7 +182,7 @@ Safety & scope:
   `post_plan_note main` explicitly does not append them to the deployable-plan
   commit comment.
 - The policies are always generated and kept as artifacts; set
-  `IAM_POLICY_AUTOPILOT_TO_MR_COMMIT: "false"` to skip appending them to the
+  `IAM_POLICY_AUTOPILOT_TO_MR_COMMENT: "false"` to skip appending them to the
   MR note (e.g. when many resources change -> the generated policies would
   make the MR comment very large). A `NOTE:` line in the job log records when
   the note append was skipped.
