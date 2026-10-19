@@ -1,0 +1,531 @@
+# IaC approval gate — CE-compatible MR approval enforcement (no Premium
+# features). Implements iac-approvers/design.md §5 as three jobs:
+#
+#   approval-gate-mr     MR pipelines (own stage `approval-gate`, AFTER
+#                        security-check — so the approver can read the plan
+#                        preview before approving, and the gate is visually
+#                        distinct from the advisory scanners). Blocks the merge
+#                        via the project's "Pipelines must succeed" setting.
+#   approval-gate-main   push-to-main pipelines (stage syntax-check — fail
+#                        fast before plan-main burns compute). apply
+#                        (templates/iac-plan-apply.yml) declares
+#                        `needs: [approval-gate-main, optional]`, so apply
+#                        is blocked unless this gate passed.
+#   approval-gate-plan-review  push-to-main pipelines, MANUAL, stage approval-gate
+#                        (after plan-main). The play-click IS the approval
+#                        act on the reviewed plan: for a manual job GitLab
+#                        sets GITLAB_USER_LOGIN/GITLAB_USER_ID to the user
+#                        who clicked play, and the gate verifies that user
+#                        is in the effective approver pool (plus re-checks
+#                        the frozen MR approvals). apply declares a
+#                        NON-optional need on this job — neutering it in a
+#                        consumer MR fails pipeline creation loudly.
+#
+# All jobs share one gate script (.iac-approval-gate): count the MR's
+# approvals (GitLab approvals API) that come from the effective approver
+# pool — cloned from the iac-approvers repo (IAC_APPROVERS_REPO_URL @
+# IAC_APPROVERS_REF, job-token allowlist clone) as
+# (global ∪ per-project additions) − per-project exclusions — are not
+# stale (given before the MR's source-branch HEAD commit), and — unless
+# IAC_APPROVAL_EXCLUDE_AUTHOR=false — are not the MR author. The threshold
+# comes from the iac-approvers repo (projects/<id>/required.txt, then root
+# required.txt) and wins over the consumer's IAC_APPROVAL_REQUIRED.
+# Everything fails closed: direct pushes to main, missing/invalid central
+# files, empty pool, unset IAC_APPROVERS_REPO_URL, rejected API calls.
+#
+# Consumer wiring, variables, tokens and the project-settings checklist:
+# design/iac-approval-gate.md (in this repo).
+#
+# On CE, approving does NOT re-run the pipeline: after the last required
+# approval, retry the failed gate job (or push a new commit).
+
+include:
+  - local: 'templates/iac-base.yml'
+
+# Stage declarations — IMPORTANT (verified on this GitLab instance, 19.4):
+# `stages` is an ARRAY, and arrays do NOT merge across includes. When the
+# consumer's .gitlab-ci.yml declares its own `stages:` (all consumers of this
+# template do), the CONSUMER's list wins entirely and this block is ignored.
+# It only takes effect for a consumer that declares no `stages:` at all.
+#
+# => CONSUMERS MUST ADD `approval-gate` TO THEIR OWN stages LIST (after
+#    security-check), or pipeline creation fails with
+#    "approval-gate-mr job: chosen stage approval-gate does not exist".
+stages:
+  - syntax-check
+  - security-check
+  - approval-gate
+
+# Inline CA trust for the gate jobs — a copy of the apply job's CA block
+# (openssl + the cert-file variables the runner already provides; no apk
+# add, no network), so the gate works on air-gapped runners against a
+# self-signed-CA GitLab by default. .iac_template_local_ca_init (apk-based,
+# in iac-base.yml) remains the alternative if the image lacks a base CA
+# bundle. The SOPS-age-key handling of the apply block is deliberately NOT
+# copied: the gate never decrypts anything.
+.iac_template_gate_ca_init:
+  before_script:
+    - |
+      set -euo pipefail
+
+      normalize_cert() {
+        input_path="$1"
+        output_path="$2"
+
+        if openssl x509 -in "$input_path" -noout >/dev/null 2>&1; then
+          openssl x509 -in "$input_path" -out "$output_path" >/dev/null 2>&1 || cp -f "$input_path" "$output_path"
+          return 0
+        fi
+
+        if openssl x509 -inform DER -in "$input_path" -noout >/dev/null 2>&1; then
+          openssl x509 -inform DER -in "$input_path" -out "$output_path"
+          return 0
+        fi
+
+        echo "ERROR: '$input_path' is not a valid X.509 certificate (PEM or DER)." >&2
+        return 1
+      }
+
+      if [ -f /etc/ssl/certs/ca-certificates.crt ]; then
+        cp /etc/ssl/certs/ca-certificates.crt /tmp/ci-ca-bundle.crt
+      elif [ -f /etc/pki/tls/certs/ca-bundle.crt ]; then
+        cp /etc/pki/tls/certs/ca-bundle.crt /tmp/ci-ca-bundle.crt
+      else
+        touch /tmp/ci-ca-bundle.crt
+      fi
+      if [ -n "${LOCAL_INTERMEDIATE_CA_CERT_FILE:-}" ] && [ -f "${LOCAL_INTERMEDIATE_CA_CERT_FILE}" ]; then
+        echo "Appending intermediate CA: ${LOCAL_INTERMEDIATE_CA_CERT_FILE}"
+        normalize_cert "${LOCAL_INTERMEDIATE_CA_CERT_FILE}" /tmp/local-intermediate.pem
+        printf '\n' >> /tmp/ci-ca-bundle.crt
+        cat /tmp/local-intermediate.pem >> /tmp/ci-ca-bundle.crt
+      fi
+      if [ -n "${LOCAL_ROOT_CA_CERT_FILE:-}" ] && [ -f "${LOCAL_ROOT_CA_CERT_FILE}" ]; then
+        echo "Appending root CA: ${LOCAL_ROOT_CA_CERT_FILE}"
+        normalize_cert "${LOCAL_ROOT_CA_CERT_FILE}" /tmp/local-root.pem
+        printf '\n' >> /tmp/ci-ca-bundle.crt
+        cat /tmp/local-root.pem >> /tmp/ci-ca-bundle.crt
+      fi
+      for runner_ca in \
+          /usr/local/share/ca-certificates/ca-cert-ca.pem \
+          /etc/ssl/certs/ca-cert-ca.pem \
+          /usr/share/ca-certificates/ca-cert-ca.pem; do
+        if [ -f "${runner_ca}" ]; then
+          echo "Appending runner-injected CA bundle: ${runner_ca}"
+          printf '\n' >> /tmp/ci-ca-bundle.crt
+          cat "${runner_ca}" >> /tmp/ci-ca-bundle.crt
+          break
+        fi
+      done
+      echo "CA bundle ready: /tmp/ci-ca-bundle.crt ($(wc -l < /tmp/ci-ca-bundle.crt) lines)"
+
+      export SSL_CERT_FILE=/tmp/ci-ca-bundle.crt
+      export AWS_CA_BUNDLE=/tmp/ci-ca-bundle.crt
+      export GIT_SSL_CAINFO=/tmp/ci-ca-bundle.crt
+      export CURL_CA_BUNDLE=/tmp/ci-ca-bundle.crt
+
+      git config --global http.sslCAInfo /tmp/ci-ca-bundle.crt
+
+# The gate script (design.md §5 steps 0–3), shared by both gate jobs. The
+# context (MR vs main) is resolved from the pipeline: CI_MERGE_REQUEST_IID
+# is predefined in MR pipelines and absent on main. No `cd` anywhere — all
+# paths are absolute (design.md §5 Step 2).
+.iac-approval-gate:
+  image: "${IAC_PIPELINE_IMAGE}"
+  variables:
+    # Nothing to fetch from the consumer repo — the gate reads the MR via
+    # the API and clones only the iac-approvers repo.
+    GIT_STRATEGY: none
+  cache: []
+  # Download no artifacts from earlier stages: the gate reads nothing from
+  # the consumer repo. Without this, approval-gate-mr (stage security-check)
+  # would download the encrypted plan artifacts of plan-mr-preview that it
+  # never uses — and fail if that job failed without artifacts (same reason
+  # check-checkov sets dependencies: []).
+  dependencies: []
+  script:
+    - |
+      set -euo pipefail
+
+      # --- Step 0: fail-closed guard + API helper ---
+
+      if [ -z "${IAC_APPROVERS_REPO_URL:-}" ]; then
+        echo "ERROR: IAC_APPROVERS_REPO_URL is not set — the approval gate cannot fetch the approver pool."
+        echo "       This is a misconfiguration, not an 'off' state: the gate fails closed."
+        exit 1
+      fi
+
+      # All GitLab REST calls go through one helper: try the ephemeral job
+      # token first, fall back to a stored token only if the endpoint
+      # rejects it. In main pipelines the fallback is GITLAB_API_TOKEN
+      # (already required by apply); in MR pipelines it is
+      # IAC_APPROVAL_GITLAB_TOKEN. The approvals endpoint is not
+      # job-token-accessible, so the fallback is expected there.
+      # Auth-path tracking. gl_api is always invoked inside a command
+      # substitution (MR_JSON="$(gl_api ...)") or a pipeline (gl_api | jq),
+      # so a variable assignment inside the function never reaches this
+      # shell — design.md §5's plain `GL_API_AUTH` variable is dead code and
+      # its "GitLab API auth path" log line always printed empty. The auth
+      # path is therefore tracked in a file (readable from this shell), and
+      # every successful call also logs one stderr line — stderr is NOT
+      # captured by $(...), so it reaches the job log, giving "which auth
+      # path served each call" (design.md §6).
+      GL_API_AUTH_FILE="$(mktemp)"
+      # stderr of the last failed job-token attempt. design.md §5 Step 0
+      # discards it (2>/dev/null); this variant keeps it and prints it only
+      # when the call fails for good — a job-token rejection is EXPECTED for
+      # the approvals endpoint, so the fallback-success path stays quiet,
+      # while the no-fallback / fallback-also-failed paths show the reason
+      # (401 vs 404 vs TLS vs DNS) for first-time-wiring debugging.
+      GL_JOB_TOKEN_ERR="$(mktemp)"
+      gl_api() {
+        local path="$1"
+        if curl -fsS --header "Job-Token: ${CI_JOB_TOKEN}" "${CI_API_V4_URL}${path}" 2>"${GL_JOB_TOKEN_ERR}"; then
+          echo "job-token" > "${GL_API_AUTH_FILE}"
+          echo "gl_api: ${path} served by job-token" >&2
+          return 0
+        fi
+        local token="${GITLAB_API_TOKEN:-${IAC_APPROVAL_GITLAB_TOKEN:-}}"
+        if [ -z "${token}" ]; then
+          echo "ERROR: job token rejected and no fallback token set for: ${path}" >&2
+          echo "--- job-token attempt stderr ---" >&2
+          cat "${GL_JOB_TOKEN_ERR}" >&2
+          return 1
+        fi
+        if curl -fsS --header "PRIVATE-TOKEN: ${token}" "${CI_API_V4_URL}${path}"; then
+          echo "stored-token" > "${GL_API_AUTH_FILE}"
+          echo "gl_api: ${path} served by stored-token" >&2
+          return 0
+        fi
+        echo "ERROR: fallback token also rejected for: ${path}" >&2
+        echo "--- job-token attempt stderr ---" >&2
+        cat "${GL_JOB_TOKEN_ERR}" >&2
+        return 1
+      }
+
+      # --- Step 1: resolve the MR context (IID + author + sha) ---
+
+      if [ -n "${CI_MERGE_REQUEST_IID:-}" ]; then
+        # MR pipeline (pre-merge): CI_MERGE_REQUEST_IID is predefined, but
+        # the author is not (GITLAB_USER_LOGIN is the pusher of the latest
+        # commit, not necessarily the MR author). One API call resolves it.
+        MR_IID="${CI_MERGE_REQUEST_IID}"
+        MR_JSON="$(gl_api "/projects/${CI_PROJECT_ID}/merge_requests/${MR_IID}")"
+        MR_AUTHOR="$(jq -r '.author.username' <<<"${MR_JSON}")"
+        MR_SHA="$(jq -r '.sha // empty' <<<"${MR_JSON}")"   # source-branch HEAD — feeds the staleness filter
+      else
+        # Main pipeline (post-merge): resolve the MR from the merge commit.
+        MR_JSON="$(gl_api "/projects/${CI_PROJECT_ID}/repository/commits/${CI_COMMIT_SHA}/merge_requests")"
+        MR_IID="$(jq -r '[.[] | select(.state == "merged")] | first | .iid // empty' <<<"${MR_JSON}")"
+        MR_AUTHOR="$(jq -r '[.[] | select(.state == "merged")] | first | .author.username // empty' <<<"${MR_JSON}")"
+        MR_SHA="$(jq -r '[.[] | select(.state == "merged")] | first | .sha // empty' <<<"${MR_JSON}")"
+        if [ -z "${MR_IID}" ]; then
+          echo "ERROR: no merged MR found for ${CI_COMMIT_SHA} (direct push to main?) — failing closed."
+          exit 1
+        fi
+      fi
+      echo "Gate context: MR !${MR_IID} (author: ${MR_AUTHOR}, sha: ${MR_SHA:-unknown})"
+
+      # --- Step 2: fetch the allowlist and resolve the effective pool ---
+
+      APPROVERS_DIR="$(mktemp -d)"
+      # One slash, not two: the pattern is https:\/\/ and the replacement
+      # must start at https (a leading / in the replacement yields
+      # /https://... — git then fails with "protocol '/https' is not
+      # supported"). Same bug existed in design.md §5.
+      APPROVERS_CLONE_URL="${IAC_APPROVERS_REPO_URL/https:\/\//https:\/\/gitlab-ci-token:${CI_JOB_TOKEN}@}"
+      git clone --depth 1 --branch "${IAC_APPROVERS_REF}" \
+        "${APPROVERS_CLONE_URL}" "${APPROVERS_DIR}/iac-approvers" \
+        || { echo "ERROR: cannot clone iac-approvers — check Token Access/visibility (fork MRs?) and IAC_APPROVERS_REF."; exit 1; }
+      SRC="${APPROVERS_DIR}/iac-approvers"
+      echo "iac-approvers: ref=${IAC_APPROVERS_REF} commit=$(git -C "${SRC}" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+
+      # norm() must not abort under set -euo pipefail: per-project overlay
+      # files are optional (missing file -> grep exit 2) and a file may
+      # contain only comments (grep exit 1, no matches). Both are valid and
+      # must yield empty output, not kill the script.
+      norm() {
+        [ -f "$1" ] || return 0                    # missing overlay file = empty
+        sed 's/^[[:space:]]*//;s/[[:space:]]*$//' "$1" | grep -vE '^(#|$)' | tr -d '\r' | tr -d '@' | tr '[:upper:]' '[:lower:]' | grep -v '^$' || true
+      }
+
+      GLOBAL="$(norm "${SRC}/approvers.txt")"
+      PROJ_DIR="${SRC}/projects/${CI_PROJECT_ID}"
+      PROJ_ADD="$(norm "${PROJ_DIR}/approvers.txt")"
+      PROJ_EXCL="$(norm "${PROJ_DIR}/exclusions.txt")"
+
+      # effective pool = (global ∪ additions) − exclusions
+      # pool scratch files live under the per-job mktemp dir — fixed /tmp paths
+      # would collide when two gate jobs share a runner host concurrently
+      POOL="${APPROVERS_DIR}/pool"
+      : > "${POOL}.all"
+      if [ -n "${GLOBAL}" ];   then printf '%s\n' "${GLOBAL}"   >> "${POOL}.all"; fi
+      if [ -n "${PROJ_ADD}" ]; then printf '%s\n' "${PROJ_ADD}" >> "${POOL}.all"; fi
+      sort -u "${POOL}.all" -o "${POOL}.all"
+
+      if [ -n "${PROJ_EXCL}" ]; then
+        printf '%s\n' "${PROJ_EXCL}" | sort -u > "${POOL}.excl"
+        comm -23 "${POOL}.all" "${POOL}.excl" > "${POOL}.effective"
+      else
+        mv "${POOL}.all" "${POOL}.effective"
+      fi
+      ALLOWED="$(cat "${POOL}.effective")"
+
+      # Threshold resolution — central policy wins (design.md §2):
+      #   1. projects/<id>/required.txt   (per-project, iac-approvers repo)
+      #   2. required.txt                 (root, global default, iac-approvers repo)
+      #   3. consumer IAC_APPROVAL_REQUIRED (weakest)
+      # Contract for both central files: the integer at the start of the FIRST
+      # line that begins (after optional whitespace) with a digit; the rest of
+      # that line is ignored (allows trailing comments). No such line -> fail
+      # closed. (Do NOT parse with `tr -dc '0-9'`: it concatenates every digit
+      # in the file — "1 # was 2 before" would parse as 12, "2.0" as 20.)
+      parse_required() {
+        local f="$1" label="$2"
+        [ -f "${f}" ] || return 1
+        local v
+        v="$(sed -n 's/^[[:space:]]*\([0-9][0-9]*\).*/\1/p' "${f}" | head -n1)"
+        if [ -z "${v}" ]; then
+          echo "ERROR: ${f} has no leading integer — failing closed."
+          exit 1
+        fi
+        echo "Threshold source: ${label} (${f}) -> ${v}"
+        if [ "${v}" = "0" ]; then
+          # 0 is honored only with an explicit '# disable' marker line — a bare 0
+          # (typo) fails closed instead of silently switching the gate off.
+          if grep -qiE '^[[:space:]]*#[[:space:]]*disable' "${f}"; then
+            echo "Approval gate disabled by ${label} = 0 (explicit '# disable' marker)."
+            exit 0
+          fi
+          echo "ERROR: ${f} sets 0 without an explicit '# disable' marker — failing closed."
+          exit 1
+        fi
+        IAC_APPROVAL_REQUIRED="${v}"
+      }
+
+      # consumer-side value — captured BEFORE parse_required, which overwrites
+      # IAC_APPROVAL_REQUIRED with the central value (checking the variable
+      # after would be dead code: a central file always leaves it non-zero).
+      CONSUMER_REQUIRED="${IAC_APPROVAL_REQUIRED:-}"
+
+      parse_required "${PROJ_DIR}/required.txt" "projects/${CI_PROJECT_ID}/required.txt" \
+        || parse_required "${SRC}/required.txt" "root required.txt" \
+        || true
+
+      if [ -f "${PROJ_DIR}/required.txt" ] || [ -f "${SRC}/required.txt" ]; then
+        # central policy exists and has set the threshold (or exited) — a
+        # consumer 0 is ignored, with a visible warning
+        if [ "${CONSUMER_REQUIRED}" = "0" ]; then
+          echo "WARNING: consumer IAC_APPROVAL_REQUIRED=0 ignored — central required.txt wins (threshold=${IAC_APPROVAL_REQUIRED})."
+        fi
+      else
+        # no central policy: the consumer value governs. Exact "0" disables;
+        # unset/empty/non-numeric is a misconfiguration -> fail closed (the
+        # template default is "1", so unset means broken wiring, not "off").
+        case "${CONSUMER_REQUIRED}" in
+          0) echo "IAC_APPROVAL_REQUIRED=0 and no central required.txt — approval gate disabled."; exit 0 ;;
+          ""|*[!0-9]*)
+            echo "ERROR: IAC_APPROVAL_REQUIRED='${CONSUMER_REQUIRED}' is unset or not a non-negative integer — failing closed."
+            exit 1 ;;
+          *) IAC_APPROVAL_REQUIRED="${CONSUMER_REQUIRED}" ;;
+        esac
+      fi
+
+      if [ -z "${ALLOWED}" ]; then
+        echo "ERROR: effective approver pool is empty — failing closed."
+        exit 1
+      fi
+
+      # No template-version marker is logged: GitLab exposes no predefined
+      # variable for the resolved ref/SHA of an include:project file, and the
+      # gate cannot know which template ref the consumer pinned (re-resolving
+      # a moving branch here would race template changes and log the wrong
+      # version). The gate-logic version in force is the template ref in the
+      # consumer's include line; the approvers-policy version IS logged
+      # (iac-approvers ref + commit above).
+      echo "Effective approver pool for project ${CI_PROJECT_ID} ($(wc -l < "${POOL}.effective") member(s)):"
+      sed 's/^/  - /' "${POOL}.effective"
+
+      # --- Step 3: the comparison rule ---
+      # An approval counts only if the approver is in the allowlist and is
+      # not stale (given before the MR's source-branch HEAD commit). Whether
+      # the MR author's own approval counts is controlled by the
+      # author-exclusion mode. Non-list approvals are ignored (not fatal).
+
+      APPROVALS="$(gl_api "/projects/${CI_PROJECT_ID}/merge_requests/${MR_IID}/approvals")"
+      # GL_API_AUTH_FILE (not a plain variable) — see the gl_api comment:
+      # the calls above run in subshells.
+      GL_API_AUTH="$(cat "${GL_API_AUTH_FILE}")"
+      echo "GitLab API auth path: ${GL_API_AUTH:-unknown}"
+
+      # author-exclusion mode: unset -> true (secure default); invalid ->
+      # warning + true. "false" lets the MR author's own approval count.
+      EXCLUDE_AUTHOR="$(printf '%s' "${IAC_APPROVAL_EXCLUDE_AUTHOR:-true}" | tr '[:upper:]' '[:lower:]')"
+      case "${EXCLUDE_AUTHOR}" in
+        true|false) ;;
+        *)
+          echo "WARNING: IAC_APPROVAL_EXCLUDE_AUTHOR='${IAC_APPROVAL_EXCLUDE_AUTHOR}' is not 'true'/'false' — treating as 'true' (secure default)."
+          EXCLUDE_AUTHOR="true"
+          ;;
+      esac
+      echo "Author exclusion: ${EXCLUDE_AUTHOR}"
+
+      # Staleness filter: drop approvals given before the MR's last push,
+      # proxied by the source-branch HEAD commit (.sha from the MR object,
+      # captured in step 1). A single-commit lookup is exact — no list
+      # endpoint, so no pagination or ordering assumptions. `created_at` is
+      # used, not `committed_date`: both may carry a timezone offset — the
+      # commits API serializes created_at in the GitLab server's LOCAL
+      # timezone (on this instance +08:00; found in production: job 6676
+      # marked a fresh approval "stale" because "…11:43Z" < "…19:35+08:00"
+      # lexicographically), while approved_at is UTC Z-format. Both sides
+      # are normalized to UTC Z-format ISO-8601 by the toz def before the
+      # lexicographic comparison. toz is fromdateiso8601-based — jq 1.7
+      # (the pipeline image) rejects mktime on a plain array (jq 1.8
+      # relaxed that); it strips fractional seconds and yields "" for
+      # empty/unparseable input (unparseable created_at -> LAST_PUSH="" ->
+      # filter skipped with the warning below; unparseable approved_at ->
+      # approval dropped, fail-closed).
+      TOZ_DEF='def toz:
+        if (. // "") == "" then ""
+        else try (
+          capture("^(?<Y>[0-9]{4})-(?<M>[0-9]{2})-(?<D>[0-9]{2})T(?<h>[0-9]{2}):(?<m>[0-9]{2}):(?<s>[0-9]{2})(?:\\.[0-9]+)?(?:(?<z>Z)|(?<sign>[+-])(?<oh>[0-9]{2}):(?<om>[0-9]{2}))?$") as $c
+          | ($c | "\(.Y)-\(.M)-\(.D)T\(.h):\(.m):\(.s)Z" | fromdateiso8601) as $e
+          | ($e + (if $c.sign == "+" then - (($c.oh | tonumber) * 3600 + ($c.om | tonumber) * 60)
+                   elif $c.sign == "-" then (($c.oh | tonumber) * 3600 + ($c.om | tonumber) * 60)
+                   else 0 end))
+          | todateiso8601)
+        catch ""
+        end;'
+      LAST_PUSH=""
+      if [ -n "${MR_SHA}" ]; then
+        LAST_PUSH="$(gl_api "/projects/${CI_PROJECT_ID}/repository/commits/${MR_SHA}" \
+          | jq -r "${TOZ_DEF} .created_at // empty | toz" 2>/dev/null || true)"
+      fi
+      if [ -n "${LAST_PUSH}" ]; then
+        echo "Staleness filter: dropping approvals older than ${LAST_PUSH} (UTC)."
+      else
+        echo "WARNING: last-push time unavailable; skipping staleness filter (core check still applies)."
+      fi
+
+      # normalize approved_at to UTC Z-format with the same toz def so the
+      # comparison below is like-for-like
+      APPROVALS="$(jq "${TOZ_DEF} .approved_by |= map(.approved_at |= toz)" <<<"${APPROVALS}")"
+
+      COUNT="$(jq -r --arg allowed "${ALLOWED}" --arg author "${MR_AUTHOR}" --arg last_push "${LAST_PUSH}" --arg excl "${EXCLUDE_AUTHOR}" '
+        ($allowed | split("\n") | map(gsub("^\\s+|\\s+$"; "") | select(length > 0))) as $pool
+        | [.approved_by[]
+           | select(($last_push == "") or ((.approved_at // "") >= $last_push))
+           | .user.username | ascii_downcase
+           | select(($excl == "false") or (. != ($author | ascii_downcase)))]
+        | map(select(. as $u | $pool | index($u)))
+        | length' <<<"${APPROVALS}")"
+
+      if [ "${COUNT}" -lt "${IAC_APPROVAL_REQUIRED:-1}" ]; then
+        echo "ERROR: ${COUNT}/${IAC_APPROVAL_REQUIRED} approvals from the iac-approvers list."
+        echo "Full approval audit (every click, with reason):"
+        jq -r --arg allowed "${ALLOWED}" --arg author "${MR_AUTHOR}" --arg last_push "${LAST_PUSH}" --arg excl "${EXCLUDE_AUTHOR}" '
+          ($allowed | split("\n") | map(gsub("^\\s+|\\s+$"; "") | select(length > 0))) as $pool
+          | .approved_by[]
+          | .user.username as $u
+          | (if ($u | ascii_downcase) == ($author | ascii_downcase) then
+               (if $excl == "false" then "COUNTS (author — exclusion off)" else "author (excluded)" end)
+             elif ($last_push != "") and ((.approved_at // "") < $last_push) then "stale (before last push)"
+             elif (($u | ascii_downcase) as $lu | ($pool | index($lu)) | not) then "not in pool"
+             else "COUNTS" end) as $reason
+          | "  \($u): \($reason)"' <<<"${APPROVALS}"
+        exit 1
+      fi
+
+      echo "Approval gate passed: ${COUNT}/${IAC_APPROVAL_REQUIRED} qualifying approval(s)."
+
+      # --- Step 4 (apply context only): verify the manual-job clicker ---
+      # approval-gate-plan-review is `when: manual` — GitLab sets
+      # GITLAB_USER_LOGIN/GITLAB_USER_ID to the user who clicked play. The
+      # click IS the approval act on the reviewed plan, so the clicker must
+      # be in the effective approver pool. This runs only in the apply
+      # context (GATE_CONTEXT=apply); the MR/main jobs never see it.
+      if [ "${GATE_CONTEXT:-}" = "apply" ]; then
+        CLICKER="${GITLAB_USER_LOGIN:-}"
+        if [ -z "${CLICKER}" ]; then
+          echo "ERROR: GITLAB_USER_LOGIN is not set — cannot attribute the manual trigger to a user. Failing closed."
+          exit 1
+        fi
+        CLICKER_LC="$(printf '%s' "${CLICKER}" | tr '[:upper:]' '[:lower:]')"
+        if printf '%s\n' "${ALLOWED}" | grep -qx "${CLICKER_LC}"; then
+          echo "Apply approval: '${CLICKER}' is in the approver pool — plan-review approval recorded."
+        else
+          echo "ERROR: '${CLICKER}' (who triggered this job) is NOT in the effective approver pool for project ${CI_PROJECT_ID}."
+          echo "       The approval-gate-plan-review play-click is the approval act on the reviewed plan;"
+          echo "       only pool members may perform it. Failing closed."
+          echo "Effective approver pool for project ${CI_PROJECT_ID}:"
+          sed 's/^/  - /' "${POOL}.effective"
+          exit 1
+        fi
+      fi
+
+# Pre-merge gate: blocks the merge via "Pipelines must succeed". Runs in its
+# own `approval-gate` stage, AFTER security-check — so the approver can read
+# the plan preview (plan stage) and the advisory scanners have finished
+# before the gate verdict, and the gate is visually distinct in the pipeline
+# graph. A gate in an earlier stage would block the plan preview exactly when
+# the approver needs it most.
+approval-gate-mr:
+  extends: .iac-approval-gate
+  stage: approval-gate
+  before_script:
+    - !reference [.iac_template_gate_ca_init, before_script]
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: on_success
+    - when: never
+
+# Post-merge gate: fail fast in the first stage, before plan-main burns
+# compute. When approval-gate-mr has done its job this always passes (a
+# few seconds of API calls); its value is defense-in-depth — it catches
+# merges that slipped past the MR gate (deleted gate job, forced merge)
+# and blocks plan-main via stage ordering, hence apply too (apply also
+# declares an explicit optional need on this job).
+#
+# Why CI_PIPELINE_SOURCE == "push": a merge to main IS a push, so this
+# matches every merge pipeline. Scheduled pipelines, webhooks, or manual
+# "Run pipeline" on main have no merge-commit MR to resolve — an
+# unrestricted rule would fail them closed forever, and because the gate
+# sits in the first stage it would block every later job. If a manual
+# main pipeline should be gated too, add `|| $CI_PIPELINE_SOURCE == "web"`
+# consciously.
+approval-gate-main:
+  extends: .iac-approval-gate
+  stage: syntax-check
+  before_script:
+    - !reference [.iac_template_gate_ca_init, before_script]
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == "main"'
+      when: on_success
+    - when: never
+
+# Plan-review approval: MANUAL, stage approval-gate (after plan-main). The
+# play-click IS the approval act on the reviewed plan — the approver reads
+# plan-main's saved plan/summaries, then clicks THIS job's play button. For
+# a manual job GitLab sets GITLAB_USER_LOGIN/GITLAB_USER_ID to the user who
+# clicked play; the gate script (Step 4, apply context) verifies the clicker
+# is in the effective approver pool, on top of re-checking the frozen MR
+# approvals. apply (templates/iac-plan-apply.yml) declares a NON-optional
+# need on this job: apply cannot start until a pool member clicked, and a
+# consumer MR that neuters this job fails pipeline creation loudly
+# ("apply job needs approval-gate-plan-review, but it was not added to the
+# pipeline") — no silent skip.
+approval-gate-plan-review:
+  extends: .iac-approval-gate
+  stage: approval-gate
+  before_script:
+    - !reference [.iac_template_gate_ca_init, before_script]
+  variables:
+    GATE_CONTEXT: "apply"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == "main"'
+      when: manual
+    - when: never
+  needs:
+    - job: plan-main
+      artifacts: false
+  manual_confirmation: 'Confirm that you reviewed the plan/summary/artifacts of plan-main for this pipeline and, as an approver pool member, approve applying that exact saved plan.'

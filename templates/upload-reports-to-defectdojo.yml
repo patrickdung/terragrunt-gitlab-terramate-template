@@ -5,6 +5,11 @@ upload:
   stage: upload-reports-to-defect-dojo
   extends: .iac_template_local_ca_init
   when: always
+  # Advisory: a DefectDojo outage (502) must not block the merge. The
+  # approval gate is the merge blocker; report uploads are telemetry.
+  # A failed upload shows as a warning (orange) in the pipeline, and the
+  # job can be retried once DefectDojo is back.
+  allow_failure: true
   needs:
     - job: syntax-tflint
       artifacts: true

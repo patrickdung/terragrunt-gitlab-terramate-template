@@ -839,6 +839,29 @@ apply:
   needs:
     - job: plan-main
       artifacts: true
+    # Approval gate (templates/iac-approval-gate.yml): when the consumer
+    # includes that file, apply cannot start unless approval-gate-main
+    # passed. `optional: true` is load-bearing: consumers that do NOT
+    # include the gate file must not get a pipeline-creation failure
+    # ("apply job needs approval-gate-main, but it was not added to the
+    # pipeline") — with optional, the need is ignored when the job is
+    # absent. artifacts: false — the gate produces nothing apply needs.
+    - job: approval-gate-main
+      optional: true
+      artifacts: false
+    # Plan-review approval (templates/iac-approval-gate.yml): the MANUAL
+    # approval-gate-plan-review job — its play-click is the approval act on the
+    # reviewed plan, and the gate verifies the clicker is in the approver
+    # pool. This need is deliberately NON-optional: apply must not start
+    # until a pool member clicked, and a consumer MR that neuters the job
+    # fails pipeline creation loudly instead of silently skipping. If a
+    # consumer does not include the gate file, approval-gate-plan-review is
+    # absent and pipeline creation fails — which is CORRECT here: without
+    # the gate there is no plan-review approval act at all, and apply must
+    # not run. (Consumers that want apply without the gate must override
+    # this needs list explicitly — a visible change.)
+    - job: approval-gate-plan-review
+      artifacts: false
   variables:
     GIT_DEPTH: 0
     GIT_STRATEGY: fetch

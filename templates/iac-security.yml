@@ -88,7 +88,12 @@ check-custom-kics:
       sast: "gl-sast-custom-kics.json"
     paths:
       - "gl-sast-custom-kics.json"
-  allow_failure: false
+  # Advisory: security findings must not block the merge — the approval
+  # gate (templates/iac-approval-gate.yml) is the merge blocker. Findings
+  # are still visible in the pipeline (orange warning) and in the SAST
+  # reports. Syntax checks (tflint, hcl validate, branch freshness) stay
+  # blocking.
+  allow_failure: true
 
 check-branch-freshness:
   stage: syntax-check
@@ -231,7 +236,8 @@ check-checkov:
     paths:
       - "checkov-gitlab-sast.json"
       - "checkov-report.xml"
-  allow_failure: false
+  # Advisory (see check-custom-kics)
+  allow_failure: true
 
 check-terrascan:
   stage: security-check
@@ -251,7 +257,8 @@ check-terrascan:
     when: always
     paths:
       - terrascan-sarif.json
-  allow_failure: false
+  # Advisory (see check-custom-kics)
+  allow_failure: true
 
 check-custom-gitleaks:
   stage: security-check
@@ -267,7 +274,8 @@ check-custom-gitleaks:
     when: always
     paths:
       - "gitleaks-sarif.json"
-  allow_failure: false
+  # Advisory (see check-custom-kics)
+  allow_failure: true
 
 .check-terrascan-to-sast-gl-by-python:
   stage: security-check-to-sast
@@ -312,6 +320,9 @@ check-terrascan-to-sast-gl-by-semgrep:
     paths:
       - terrascan-sarif.json
       - gl-sast-report-terrascan.json
+  # Advisory (see check-custom-kics): runs with when: always after a
+  # possibly-failed check-terrascan — must not block the pipeline either.
+  allow_failure: true
 
 check-trivy:
   stage: security-check
@@ -336,7 +347,8 @@ check-trivy:
     when: always
     paths:
       - trivy-sarif.json
-  allow_failure: false
+  # Advisory (see check-custom-kics)
+  allow_failure: true
 
 check-trivy-to-sast-gl-by-semgrep:
   stage: security-check-to-sast
@@ -359,3 +371,6 @@ check-trivy-to-sast-gl-by-semgrep:
     paths:
       - trivy-sarif.json
       - gl-sast-report-trivy.json
+  # Advisory (see check-custom-kics): runs with when: always after a
+  # possibly-failed check-trivy — must not block the pipeline either.
+  allow_failure: true

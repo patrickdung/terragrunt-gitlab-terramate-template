@@ -105,6 +105,7 @@ In that new pipeline:
 - [Base Configurations & CA Init](design/iac-base.md) - Global variables and TLS normalization.
 - [Security Scanning](design/iac-security.md) - Linting (TFLint, KICS and so on.) and reporting.
 - [Deployment Workflow](design/iac-plan-apply.md) - Encryption of plan files, MR reporting, and manual applies.
+- [Approval Gate](design/iac-approval-gate.md) - CE-compatible MR approval enforcement from a centrally-governed approver pool.
 - [Debug Vault Helpers](design/debug-vault-helpers.md) - Authentication and secret retrieval with Hashicorp Vault, **for debugging only**.
 - [DefectDojo Integration](design/upload-reports-to-defectdojo.md) - Upload reports to Defectdojo for centralized vulnerability management.
 - [Homelab Defaults](design/custom-homelab-defaults.md) - Specifically designed for **a homelab setting. Do not include this in other environments.** Set your own values via CI/CD variables instead.
@@ -127,6 +128,7 @@ stages:
   - syntax-check
   - plan
   - security-check
+  - approval-gate
   - security-check-to-sast
   - upload-reports-to-defect-dojo
   - apply
@@ -138,12 +140,25 @@ include:
     file:
       - 'templates/iac-security.yml'
       - 'templates/iac-plan-apply.yml'
+      - 'templates/iac-approval-gate.yml'
       - 'templates/upload-reports-to-defectdojo.yml'
       # Optional: include only if you use SOPS AGE / Hashicorp Vault for secret retrieval
       # - 'templates/debug-vault-helpers.yml'
 ```
 
 The caller repository keeps ownership of its Terramate stack definitions, Terragrunt backend configuration, Terraform/OpenTofu code, and project-level CI/CD variables.
+
+## IaC Approval Gate (CE)
+
+`templates/iac-approval-gate.yml` enforces merge-request approvals on GitLab CE
+(no Premium features): the gate jobs count the MR's approvals from a
+centrally-governed approver pool (a separate `iac-approvers` repo) and fail
+closed unless the required threshold is met — blocking the merge via
+"Pipelines must succeed" and blocking `apply` via an optional `needs` entry.
+Security scanners are advisory (`allow_failure: true`); the approval gate is
+the merge blocker. See [design/iac-approval-gate.md](design/iac-approval-gate.md)
+for wiring, variables, tokens, the project-settings checklist and the threat
+model.
 
 ## Required CI/CD Variables
 
@@ -204,6 +219,19 @@ variable is set but incomplete.
 - `VAULT_ADDR` — required when using Vault helper jobs
 - `VAULT_ID_TOKEN_AUDIENCE` — required when using Vault helper jobs
 - `VAULT_AUTH_ROLE` — required when using Vault helper jobs
+- `IAC_APPROVERS_REPO_URL` — full https clone URL of the `iac-approvers`
+  repo. **Required when including `templates/iac-approval-gate.yml`** — when
+  empty the gate jobs fail closed (misconfiguration, not "off").
+- `IAC_APPROVERS_REF` — branch or tag of the `iac-approvers` repo the gate
+  clones (default `main`; recommend a pinned tag in real use).
+- `IAC_APPROVAL_REQUIRED` — consumer default approval threshold (default
+  `1`). Ignored when a central `required.txt` exists in the approvers repo —
+  central policy wins.
+- `IAC_APPROVAL_EXCLUDE_AUTHOR` — `true` (default): the MR author's own
+  approval never counts; `false`: it counts (solo-maintainer case).
+- `IAC_APPROVAL_GITLAB_TOKEN` — approvals-API fallback token (`read_api`
+  scope, Reporter role is sufficient), **masked** and **unprotected**. Only
+  needed if the approvals endpoint rejects the job token.
 
 ## Common Overrides
 

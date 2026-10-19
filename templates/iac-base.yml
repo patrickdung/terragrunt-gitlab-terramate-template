@@ -42,6 +42,22 @@ variables:
   # aws_signing_helper credential_process (see .iac_template_aws_ra_init below).
   # Default "false" -> the RA before_script is a no-op for consumers that don't use it.
   AWS_RA_ENABLED: "false"
+  # --- IaC approval gate (templates/iac-approval-gate.yml) ---
+  # Consumer default for the minimum number of qualifying approvals an MR must
+  # have. "0" disables the gate ONLY when no central required.txt exists (root
+  # or projects/<id>/ in the iac-approvers repo) — central policy wins.
+  IAC_APPROVAL_REQUIRED: "1"
+  # Author-exclusion mode: "true" (default) — the MR author's own approval
+  # never counts (two-eyes rule); "false" — it counts (solo-maintainer case).
+  # Invalid values fall back to "true" (secure default) with a warning.
+  IAC_APPROVAL_EXCLUDE_AUTHOR: "true"
+  # Full https clone URL of the iac-approvers repo, e.g.
+  # https://gitlab.local.nonet/homelab/iac-approvers.git
+  # When empty, the gate jobs fail closed (misconfiguration, not "off").
+  IAC_APPROVERS_REPO_URL: ""
+  # Branch or tag of the iac-approvers repo the gate clones. Recommend a pinned
+  # tag (approvers-v1) in real use; must be a branch or tag name, not a SHA.
+  IAC_APPROVERS_REF: "main"
 
 .iac_template_local_ca_init:
   before_script:

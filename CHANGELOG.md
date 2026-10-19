@@ -2,6 +2,112 @@
 
 All notable changes to this template repository are documented in this file.
 
+## 2026-10-19
+
+### Added (IaC approval gate — CE-compatible MR approval enforcement)
+
+- **`templates/iac-approval-gate.yml`** (new) — enforces merge-request
+  approvals on GitLab CE (no Premium features). Three jobs share one gate
+  script:
+  - `approval-gate-mr` (own stage `approval-gate`, after `security-check`,
+    MR pipelines only) — blocks
+    the merge via the project's "Pipelines must succeed" setting. Runs after
+    `plan` on purpose: the approver needs to read the plan preview before
+    approving. Consumers MUST declare the `approval-gate` stage in their own
+    `stages:` list (arrays do not merge across includes; the consumer's list
+    wins).
+  - `approval-gate-main` (stage `syntax-check`, push-to-`main` pipelines
+    only) — fail-fast defense-in-depth; blocks `plan-main` via stage
+    ordering, hence `apply`.
+  - `approval-gate-plan-review` (stage `approval-gate`, push-to-`main` pipelines
+    only, `when: manual`) — the plan-review approval act: the approver
+    reads `plan-main`'s saved plan/summaries, then clicks play. For a
+    manual job GitLab sets `GITLAB_USER_LOGIN`/`GITLAB_USER_ID` to the
+    user who clicked; the gate verifies the clicker is in the effective
+    approver pool (plus re-checks the frozen MR approvals). The clicker
+    check is **1-of-N** (the clicker must be in the pool — one
+    qualifying act, not a count), an additional requirement on top of
+    the frozen-approvals re-count, not a replacement for it; the click
+    does not add to the count (the MR is locked post-merge). `apply`
+    declares a NON-optional need on this job — apply cannot start until a
+    pool member clicked, and neutering the job in a consumer MR fails
+    pipeline creation loudly (no silent skip).
+  - The gate counts approvals from the effective approver pool — cloned
+    from a centrally-governed `iac-approvers` repo with the ephemeral
+    `CI_JOB_TOKEN` as (global ∪ per-project additions) − per-project
+    exclusions — that are not stale (given before the MR's source-branch
+    HEAD commit) and not the MR author (author-exclusion mode, default on).
+    The threshold comes from the approvers repo (`projects/<id>/required.txt`,
+    then root `required.txt`) and wins over the consumer's
+    `IAC_APPROVAL_REQUIRED` — central policy cannot be switched off from
+    a consumer MR. Everything fails closed (direct pushes to `main`, missing
+    or invalid central files, empty pool, unset `IAC_APPROVERS_REPO_URL`,
+    rejected API calls). On failure the job log prints a full audit of every
+    approval click (`COUNTS` / `author (excluded)` / `stale (before last
+    push)` / `not in pool`).
+  - The staleness comparison is timezone-safe: the commits API may return
+    `created_at` with the server's local UTC offset while `approved_at` is
+    UTC Z-format; both are normalized
+    to UTC Z-format ISO-8601 by a jq `toz` def (`fromdateiso8601`-based,
+    jq-1.7-compatible) before the string comparison.
+  - Ships its own inline CA-trust `before_script`
+    (`.iac_template_gate_ca_init`, a copy of the apply job's CA block — no
+    `apk add`, no network) so the gate works on air-gapped runners against a
+    self-signed-CA GitLab by default.
+  - The gate jobs download no artifacts (`dependencies: []` — the gate
+    reads nothing from the consumer repo). GitLab API debugging: every call
+    logs which auth path served it (job-token vs stored token), and when a
+    call fails for good the log shows why the job-token attempt was
+    rejected (401 vs 404 vs TLS). The auth path is tracked via a temp file
+    (a plain `GL_API_AUTH` variable was dead code — `gl_api` always runs
+    inside a command substitution/pipeline, so its assignment never
+    reached the parent shell).
+- **`templates/iac-base.yml`** — new gate variables:
+  `IAC_APPROVAL_REQUIRED` (default `"1"`), `IAC_APPROVAL_EXCLUDE_AUTHOR`
+  (default `"true"`), `IAC_APPROVERS_REPO_URL` (default `""` — the gate
+  fails closed when unset), and `IAC_APPROVERS_REF` (default `"main"`).
+  There is deliberately no template-version variable: GitLab exposes no
+  variable for the resolved ref/SHA of an `include:project` file, so the
+  gate-logic version in force is the template `ref` pinned in the consumer's
+  `include` line (see design/iac-approval-gate.md).
+- **`templates/iac-plan-apply.yml`** — `apply` now declares
+  `needs: [approval-gate-main, optional: true]`. `optional` is
+  load-bearing: consumers that do not include the gate file must not get a
+  pipeline-creation failure; with the gate included, `apply` cannot start
+  unless the main gate passed. `apply` also declares a NON-optional need on
+  `approval-gate-plan-review` — apply cannot start until a pool member
+  clicked the manual plan-review job; consumers that do not include the gate
+  file get a loud pipeline-creation failure (correct: without the gate there
+  is no plan-review approval act; they must override `apply`'s needs
+  explicitly to run apply ungated).
+- **`design/iac-approval-gate.md`** (new) — consumer documentation: wiring,
+  variables, tokens (job-token allowlist clone; `read_api` fallback token,
+  Reporter role sufficient, masked + unprotected), the project-settings
+  checklist (Pipelines must succeed, delete source branch on merge,
+  protected `main`), CE retry UX, edge cases, verification checklist, threat
+  model and upgrade paths (Premium native rules; external webhook server).
+- **`README.md`** — new "IaC Approval Gate (CE)" section, the gate include
+  in the consumer example, the `approval-gate` stage in the example stages
+  list, and the gate variables in the CI/CD variables list.
+
+### Changed (security scanners are advisory)
+
+- **`templates/upload-reports-to-defectdojo.yml`** — the DefectDojo `upload`
+  job is now advisory (`allow_failure: true`): a DefectDojo outage (502)
+  must not block the merge — the approval gate is the merge blocker, report
+  uploads are telemetry. A failed
+  upload shows as a warning (orange) in the pipeline, and the job can be
+  retried once DefectDojo is back.
+- **`templates/iac-security.yml`** — the security scanners are now
+  advisory (`allow_failure: true`): `check-custom-kics`, `check-checkov`,
+  `check-terrascan`, `check-custom-gitleaks`, `check-trivy`, and the two
+  SAST converters (`check-terrascan-to-sast-gl-by-semgrep`,
+  `check-trivy-to-sast-gl-by-semgrep`). Findings are still visible in the
+  pipeline (orange warning) and in the SAST reports, but they no longer
+  block the merge — the approval gate is the merge blocker. Syntax checks
+  (`syntax-tflint`, `terragrunt-hcl-validate-use-prebuilt-container`,
+  `check-branch-freshness`) stay blocking.
+
 ## 2026-10-14
 
 ### Changed (stack dependency ordering — DAG-aware plan/apply)
