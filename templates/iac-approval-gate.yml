@@ -245,7 +245,7 @@ stages:
       # must yield empty output, not kill the script.
       norm() {
         [ -f "$1" ] || return 0                    # missing overlay file = empty
-        sed 's/^[[:space:]]*//;s/[[:space:]]*$//' "$1" | grep -vE '^(#|$)' | tr -d '\r' | tr -d '@' | tr '[:upper:]' '[:lower:]' | grep -v '^$' || true
+        sed 's/^[[:space:]]*//;s/[[:space:]]*$//' "$1" | grep -vE '^(#|$)' | tr -d '\r' | sed 's/^@//' | tr '[:upper:]' '[:lower:]' | grep -v '^$' || true
       }
 
       GLOBAL="$(norm "${SRC}/approvers.txt")"
@@ -261,6 +261,15 @@ stages:
       if [ -n "${GLOBAL}" ];   then printf '%s\n' "${GLOBAL}"   >> "${POOL}.all"; fi
       if [ -n "${PROJ_ADD}" ]; then printf '%s\n' "${PROJ_ADD}" >> "${POOL}.all"; fi
       sort -u "${POOL}.all" -o "${POOL}.all"
+
+      # A line still containing '@' after the leading-mention strip is a
+      # misconfiguration: GitLab usernames cannot contain '@', so it can
+      # never match — fail closed instead of silently dropping the entry.
+      if grep -q '@' "${POOL}.all"; then
+        echo "ERROR: approver pool contains entries with '@' (not valid GitLab usernames):"
+        grep '@' "${POOL}.all" | sed 's/^/  - /'
+        exit 1
+      fi
 
       if [ -n "${PROJ_EXCL}" ]; then
         printf '%s\n' "${PROJ_EXCL}" | sort -u > "${POOL}.excl"
@@ -371,7 +380,9 @@ stages:
 
       # Staleness filter: drop approvals given before the MR's last push,
       # proxied by the source-branch HEAD commit (.sha from the MR object,
-      # captured in step 1). A single-commit lookup is exact — no list
+      # captured in step 1). Note: created_at is commit time, not push
+      # time — a backdated commit can make a pre-push approval count as
+      # fresh (design.md §7.3). A single-commit lookup is exact — no list
       # endpoint, so no pagination or ordering assumptions. `created_at` is
       # used, not `committed_date`: both may carry a timezone offset — the
       # commits API serializes created_at in the GitLab server's LOCAL
@@ -408,12 +419,15 @@ stages:
       fi
 
       # normalize approved_at to UTC Z-format with the same toz def so the
-      # comparison below is like-for-like
-      APPROVALS="$(jq "${TOZ_DEF} .approved_by |= map(.approved_at |= toz)" <<<"${APPROVALS}")"
+      # comparison below is like-for-like. `//= []` guards a missing
+      # approved_by key: without it jq errors ("Cannot iterate over null"),
+      # COUNT comes back empty, and the job dies on a bash integer error
+      # instead of the legible "0/N approvals" failure below.
+      APPROVALS="$(jq "${TOZ_DEF} .approved_by //= [] | .approved_by |= map(.approved_at |= toz)" <<<"${APPROVALS}")"
 
       COUNT="$(jq -r --arg allowed "${ALLOWED}" --arg author "${MR_AUTHOR}" --arg last_push "${LAST_PUSH}" --arg excl "${EXCLUDE_AUTHOR}" '
         ($allowed | split("\n") | map(gsub("^\\s+|\\s+$"; "") | select(length > 0))) as $pool
-        | [.approved_by[]
+        | [(.approved_by // [])[]
            | select(($last_push == "") or ((.approved_at // "") >= $last_push))
            | .user.username | ascii_downcase
            | select(($excl == "false") or (. != ($author | ascii_downcase)))]
@@ -425,7 +439,7 @@ stages:
         echo "Full approval audit (every click, with reason):"
         jq -r --arg allowed "${ALLOWED}" --arg author "${MR_AUTHOR}" --arg last_push "${LAST_PUSH}" --arg excl "${EXCLUDE_AUTHOR}" '
           ($allowed | split("\n") | map(gsub("^\\s+|\\s+$"; "") | select(length > 0))) as $pool
-          | .approved_by[]
+          | (.approved_by // [])[]
           | .user.username as $u
           | (if ($u | ascii_downcase) == ($author | ascii_downcase) then
                (if $excl == "false" then "COUNTS (author — exclusion off)" else "author (excluded)" end)

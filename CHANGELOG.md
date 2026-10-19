@@ -50,6 +50,12 @@ All notable changes to this template repository are documented in this file.
     UTC Z-format; both are normalized
     to UTC Z-format ISO-8601 by a jq `toz` def (`fromdateiso8601`-based,
     jq-1.7-compatible) before the string comparison.
+  - Hardening (review): a missing `approved_by` in the approvals API
+    response now yields a legible `0/N approvals` failure instead of a
+    jq "Cannot iterate over null" error; pool lines still containing `@`
+    after the leading-mention strip fail closed (GitLab usernames cannot
+    contain `@` — previously `tr -d '@'` silently mangled
+    `alice@example.com` into a never-matching entry).
   - Ships its own inline CA-trust `before_script`
     (`.iac_template_gate_ca_init`, a copy of the apply job's CA block — no
     `apk add`, no network) so the gate works on air-gapped runners against a
