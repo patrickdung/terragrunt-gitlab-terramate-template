@@ -4,7 +4,14 @@ include:
 .iac_template_plan_base:
   stage: plan
   image: "${IAC_PIPELINE_IMAGE}"
-  resource_group: "${IAC_RESOURCE_GROUP}"
+  # NOTE: deliberately NO resource_group here. A resource group serializes
+  # every job that declares it, across all pipelines. Putting it on the plan
+  # base made every MR's plan-mr-preview queue behind plan-main and behind
+  # every other MR's preview — a pure throughput loss, because planning does
+  # not mutate shared state. Per-stack state locking (the backend's own lock,
+  # e.g. S3 use_lockfile / DynamoDB) already prevents concurrent state
+  # operations on the same stack. The group is declared on `apply` only,
+  # where it is load-bearing: two applies must never run at the same time.
   variables:
     GIT_STRATEGY: clone
     GIT_DEPTH: 0
@@ -32,6 +39,26 @@ include:
     # "false" to keep the log small when many resources change (the artifacts
     # and the optional MR comment still exist).
     IAM_POLICY_AUTOPILOT_APPEND_TO_JOB_LOG: "true"
+    # Plan-JSON security scan. The security stage's scanners only see .tf
+    # files present in the consumer repo; a Terragrunt repo has none (modules
+    # come from `terraform { source = ... }`), so that stage passes vacuously.
+    # When "true" (default) the plan jobs run `checkov --framework
+    # terraform_plan` against each stack's resolved `terragrunt show -json`
+    # output — real coverage of the resources that would actually be created.
+    # Advisory only: findings never fail the plan. Requires the checkov binary
+    # in IAC_PIPELINE_IMAGE; when absent the scan is skipped with a NOTE.
+    IAC_PLAN_JSON_SCAN_ENABLED: "true"
+    # Last-applied ref tracking. Change detection is git-based, so a stack
+    # that was planned but never applied is invisible to later pipelines
+    # (drift). When "true" (default), `apply` records the applied commit SHA
+    # as a GitLab generic package and the plan jobs use
+    # `terramate list --changed --git-ref <sha>` so everything committed
+    # since the last successful apply is re-planned. Requires
+    # GITLAB_API_TOKEN (already required by apply); without it both sides
+    # degrade to plain --changed.
+    IAC_LAST_APPLIED_REF_ENABLED: "true"
+    # Name of the generic package that stores the last-applied SHA.
+    IAC_LAST_APPLIED_PACKAGE: "iac-last-applied"
   before_script:
     - |
       set -euo pipefail
@@ -209,6 +236,37 @@ include:
         echo "  HTTP status: ${code}"
         echo "  curl stderr: $(head -c 500 "${err_file}" 2>/dev/null)"
         echo "  Response: $(head -c 500 "${resp_file}" 2>/dev/null)"
+        # Turn the opaque status into an actionable hint. The most common
+        # failure in practice is a bad/expired GITLAB_API_TOKEN, which GitLab
+        # reports as 401 {"error":"invalid_token"} — the note is then silently
+        # missing from the MR and the plan job still goes green.
+        case "${code}" in
+          401)
+            echo "  HINT: 401 — the token was rejected. GitLab's 'invalid_token' means"
+            echo "        the token VALUE is not usable, which is NOT the same as the token"
+            echo "        being expired. Check, in this order:"
+            echo "        1) Is the variable MASKED? A masked variable whose value does not"
+            echo "           match GitLab's masking rules is stored but substituted as an"
+            echo "           EMPTY string in the job — the header then reads 'PRIVATE-TOKEN: '"
+            echo "           and GitLab answers invalid_token. Check the job log for a"
+            echo "           'This CI/CD variable cannot be masked' warning."
+            echo "        2) Is the variable PROTECTED? MR pipelines run on"
+            echo "           refs/merge-requests/... (not a protected ref), so a protected"
+            echo "           variable is simply absent here."
+            echo "        3) Does the value have stray whitespace/newline or quotes? Use"
+            echo "           'printf %s \"\$TOKEN\" | wc -c' to compare with the expected length."
+            echo "        4) Only then: expired or revoked (check the token's expiry date)."
+            echo "        The plan itself is unaffected; only the MR note / commit comment"
+            echo "        was skipped."
+            ;;
+          403)
+            echo "  HINT: 403 — the token is valid but lacks permission (role too low, or"
+            echo "        the project is not in the token's scope). Needs Maintainer+ for notes."
+            ;;
+          404)
+            echo "  HINT: 404 — wrong project/MR id, or the token cannot see the project."
+            ;;
+        esac
         rm -f "${resp_file}" "${err_file}"
         return 0
       }
@@ -471,7 +529,30 @@ plan-mr-preview:
       # a changed stack (their inputs may change) and iterate in dependency
       # (DAG) execution order so the per-stack loop plans dependencies
       # before dependents.
-      CHANGED_STACKS="$(terramate list --changed ${IAC_TERRAMATE_PLAN_EXTRA_FLAGS})"
+      #
+      # Change base: prefer the last successfully applied commit (recorded by
+      # `apply` as a generic package) over the default branch. Plain
+      # `--changed` on the default branch compares against the branch tip,
+      # which can resolve to an EMPTY set — and a stack that was planned but
+      # never applied is then invisible to every later pipeline (drift).
+      # `--git-ref <last-applied>` re-plans everything committed since the
+      # last successful apply, which is exactly the set that may be unapplied.
+      # Falls back to plain --changed when the marker is unavailable.
+      CHANGE_BASE_ARGS=""
+      if [ "${IAC_LAST_APPLIED_REF_ENABLED:-true}" = "true" ] && [ -n "${GITLAB_API_TOKEN:-}" ]; then
+        last_applied_pkg="${IAC_LAST_APPLIED_PACKAGE:-iac-last-applied}"
+        last_applied_sha="$(curl --silent --fail \
+            --header "PRIVATE-TOKEN: ${GITLAB_API_TOKEN}" \
+            "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${last_applied_pkg}/latest/last-applied-sha.txt" \
+          2>/dev/null | head -n 1 | tr -d '[:space:]' || true)"
+        if [ -n "${last_applied_sha}" ] && git cat-file -e "${last_applied_sha}^{commit}" 2>/dev/null; then
+          echo "Change base: last successfully applied commit ${last_applied_sha}"
+          CHANGE_BASE_ARGS="--git-ref ${last_applied_sha}"
+        else
+          echo "NOTE: no usable last-applied ref (got '${last_applied_sha:-<none>}'); using default --changed base."
+        fi
+      fi
+      CHANGED_STACKS="$(terramate list --changed ${CHANGE_BASE_ARGS} ${IAC_TERRAMATE_PLAN_EXTRA_FLAGS})"
       if [ -z "${CHANGED_STACKS}" ]; then
         echo "No changed stacks detected. Nothing to plan."
         exit 0
@@ -589,15 +670,57 @@ plan-mr-preview:
             [ -s "${module_policies_stderr_file}" ] || rm -f "${module_policies_stderr_file}"
           fi
 
-          rm -f "${module_plan_file}" "${module_show_file}"
+          # NOTE: ${module_show_file} is deliberately NOT deleted here — the
+          # plan-JSON security scan below (after the loop) needs it. It is
+          # removed right after that scan.
+          rm -f "${module_plan_file}"
         )
       done <<< "${CHANGED_STACKS}"
+
+      # --- Plan-JSON security scan (see design/iac-security.md) -------------
+      # The security stage's scanners (checkov/terrascan/trivy/kics/tflint)
+      # only see .tf files present in THIS repo. A Terragrunt consumer repo
+      # has none — modules are pulled via `terraform { source = ... }` — so
+      # that stage passes vacuously. The resolved plan JSON is the only
+      # artifact that describes the resources that would actually be created,
+      # so scan it here with Checkov's terraform_plan framework.
+      # Advisory only: never fails the plan.
+      if [ "${IAC_PLAN_JSON_SCAN_ENABLED:-true}" = "true" ]; then
+        if command -v checkov >/dev/null 2>&1; then
+          echo "--- checkov --framework terraform_plan (resolved plan JSON) ---"
+          mkdir -p "${PLAN_ROOT}/reports/plan-scan"
+          plan_scan_found=0
+          for pj in "${PLAN_ROOT}"/*.show.json; do
+            [ -s "${pj}" ] || continue
+            plan_scan_found=1
+            pj_base="$(basename "${pj}" .show.json)"
+            checkov -f "${pj}" --framework terraform_plan \
+              -o cli -o json \
+              --output-file-path console,"${PLAN_ROOT}/reports/plan-scan/${pj_base}.checkov.json" \
+              || echo "WARN[plan-scan]: checkov reported findings or failed for ${pj_base} (advisory, non-fatal)"
+          done
+          if [ "${plan_scan_found}" -eq 0 ]; then
+            echo "NOTE[plan-scan]: no .show.json produced; nothing to scan."
+          fi
+        else
+          echo "NOTE[plan-scan]: checkov not found in IAC_PIPELINE_IMAGE; plan-JSON scan skipped."
+        fi
+      else
+        echo "NOTE[plan-scan]: disabled (IAC_PLAN_JSON_SCAN_ENABLED=${IAC_PLAN_JSON_SCAN_ENABLED:-})"
+      fi
+      # The raw plan JSON is never kept as an artifact (it can carry attribute
+      # values); only the checkov JSON report under reports/plan-scan/ is.
+      rm -f "${PLAN_ROOT}"/*.show.json
 
       post_plan_note preview
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
   artifacts:
     when: always
+    # Match plan-main: the reports/ directory contains tfplan2md markdown and
+    # the .plan.txt fallback, both rendered from `terragrunt show -json`, so
+    # they can carry resource attribute values. Developer+ only.
+    access: developer
     paths:
       - .terragrunt-plans/
 
@@ -667,7 +790,30 @@ plan-main:
       # (DAG) execution order so the per-stack loop plans dependencies
       # before dependents. The manifest written below therefore lists
       # stacks in DAG order, and the apply job iterates it in that order.
-      CHANGED_STACKS="$(terramate list --changed ${IAC_TERRAMATE_PLAN_EXTRA_FLAGS})"
+      #
+      # Change base: prefer the last successfully applied commit (recorded by
+      # `apply` as a generic package) over the default branch. Plain
+      # `--changed` on the default branch compares against the branch tip,
+      # which can resolve to an EMPTY set — and a stack that was planned but
+      # never applied is then invisible to every later pipeline (drift).
+      # `--git-ref <last-applied>` re-plans everything committed since the
+      # last successful apply, which is exactly the set that may be unapplied.
+      # Falls back to plain --changed when the marker is unavailable.
+      CHANGE_BASE_ARGS=""
+      if [ "${IAC_LAST_APPLIED_REF_ENABLED:-true}" = "true" ] && [ -n "${GITLAB_API_TOKEN:-}" ]; then
+        last_applied_pkg="${IAC_LAST_APPLIED_PACKAGE:-iac-last-applied}"
+        last_applied_sha="$(curl --silent --fail \
+            --header "PRIVATE-TOKEN: ${GITLAB_API_TOKEN}" \
+            "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${last_applied_pkg}/latest/last-applied-sha.txt" \
+          2>/dev/null | head -n 1 | tr -d '[:space:]' || true)"
+        if [ -n "${last_applied_sha}" ] && git cat-file -e "${last_applied_sha}^{commit}" 2>/dev/null; then
+          echo "Change base: last successfully applied commit ${last_applied_sha}"
+          CHANGE_BASE_ARGS="--git-ref ${last_applied_sha}"
+        else
+          echo "NOTE: no usable last-applied ref (got '${last_applied_sha:-<none>}'); using default --changed base."
+        fi
+      fi
+      CHANGED_STACKS="$(terramate list --changed ${CHANGE_BASE_ARGS} ${IAC_TERRAMATE_PLAN_EXTRA_FLAGS})"
       if [ -z "${CHANGED_STACKS}" ]; then
         echo "No changed stacks detected. Nothing to plan."
         exit 0
@@ -754,7 +900,9 @@ plan-main:
             fi
           fi
 
-          rm -f "${module_show_file}"
+          # NOTE: ${module_show_file} is deliberately NOT deleted here — the
+          # plan-JSON security scan below (after the loop) needs it. It is
+          # removed right after that scan.
 
           openssl enc -aes-256-cbc -pbkdf2 -salt \
             -pass env:TF_STATE_ARTIFACT_ENCRYPTION_KEY \
@@ -774,6 +922,38 @@ plan-main:
 
       echo "Plan manifest generated:"
       cat "${MANIFEST_FILE}"
+
+      # --- Plan-JSON security scan (see design/iac-security.md) -------------
+      # The security stage's scanners (checkov/terrascan/trivy/kics/tflint)
+      # only see .tf files present in THIS repo. A Terragrunt consumer repo
+      # has none — modules are pulled via `terraform { source = ... }` — so
+      # that stage passes vacuously. The resolved plan JSON is the only
+      # artifact that describes the resources that will actually be created,
+      # so scan it here with Checkov's terraform_plan framework.
+      # Advisory only: never fails the plan.
+      if [ "${IAC_PLAN_JSON_SCAN_ENABLED:-true}" = "true" ]; then
+        if command -v checkov >/dev/null 2>&1; then
+          echo "--- checkov --framework terraform_plan (resolved plan JSON) ---"
+          mkdir -p "${REPORT_ROOT}/plan-scan"
+          plan_scan_found=0
+          for pj in "${PLAN_ROOT}"/*.show.json; do
+            [ -s "${pj}" ] || continue
+            plan_scan_found=1
+            pj_base="$(basename "${pj}" .show.json)"
+            checkov -f "${pj}" --framework terraform_plan \
+              -o cli -o json \
+              --output-file-path console,"${REPORT_ROOT}/plan-scan/${pj_base}.checkov.json" \
+              || echo "WARN[plan-scan]: checkov reported findings or failed for ${pj_base} (advisory, non-fatal)"
+          done
+          if [ "${plan_scan_found}" -eq 0 ]; then
+            echo "NOTE[plan-scan]: no .show.json left to scan (already deleted by the loop)."
+          fi
+        else
+          echo "NOTE[plan-scan]: checkov not found in IAC_PIPELINE_IMAGE; plan-JSON scan skipped."
+        fi
+      else
+        echo "NOTE[plan-scan]: disabled (IAC_PLAN_JSON_SCAN_ENABLED=${IAC_PLAN_JSON_SCAN_ENABLED:-})"
+      fi
 
       post_plan_note main
   rules:
@@ -835,6 +1015,9 @@ plan-main-save-plan-summary:
 apply:
   stage: apply
   image: "${IAC_PIPELINE_IMAGE}"
+  # The ONLY job that takes the resource group: applies mutate shared state
+  # and must never overlap. Plan jobs are intentionally NOT in the group
+  # (see .iac_template_plan_base) — per-stack state locking covers them.
   resource_group: "${IAC_RESOURCE_GROUP}"
   needs:
     - job: plan-main
@@ -1077,6 +1260,37 @@ apply:
       done < "${MANIFEST_FILE}"
 
       echo "All modules applied successfully."
+
+      # --- Record the last successfully applied commit ----------------------
+      # Change detection is git-based (terramate list --changed), not
+      # state-based. Without a marker, a stack that was planned but never
+      # applied is invisible to the NEXT pipeline: the next merge's diff does
+      # not touch it, so it is not re-planned and the change is silently lost
+      # (drift). Writing the applied SHA here lets the plan jobs use
+      # `terramate list --git-ref <sha>` so anything committed since the last
+      # successful apply is re-planned automatically.
+      #
+      # Storage: a GitLab generic package (no extra infrastructure, survives
+      # artifact expiry, readable by later pipelines). Non-fatal on failure —
+      # the plan jobs fall back to plain --changed.
+      if [ "${IAC_LAST_APPLIED_REF_ENABLED:-true}" = "true" ]; then
+        if [ -n "${GITLAB_API_TOKEN:-}" ]; then
+          last_applied_pkg="${IAC_LAST_APPLIED_PACKAGE:-iac-last-applied}"
+          echo "Recording last-applied ref ${CI_COMMIT_SHA} (package ${last_applied_pkg})..."
+          printf '%s\n' "${CI_COMMIT_SHA}" > /tmp/last-applied-sha.txt
+          curl --silent --fail --request PUT \
+            --header "PRIVATE-TOKEN: ${GITLAB_API_TOKEN}" \
+            --form "file=@/tmp/last-applied-sha.txt" \
+            "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${last_applied_pkg}/latest/last-applied-sha.txt" \
+            && echo "Last-applied ref recorded: ${CI_COMMIT_SHA}" \
+            || echo "WARNING: could not record last-applied ref (non-fatal; plan jobs fall back to --changed)"
+          rm -f /tmp/last-applied-sha.txt
+        else
+          echo "NOTE: GITLAB_API_TOKEN not set; last-applied ref not recorded."
+        fi
+      else
+        echo "NOTE: last-applied ref recording disabled (IAC_LAST_APPLIED_REF_ENABLED=${IAC_LAST_APPLIED_REF_ENABLED:-})"
+      fi
 
       # Actively delete plan-main's artifact so its encrypted saved plan
       # cannot be re-applied a second time within the expire_in window.

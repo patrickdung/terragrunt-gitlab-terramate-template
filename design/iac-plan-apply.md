@@ -5,6 +5,11 @@ The `iac-plan-apply.md` template implements the core deployment workflow for mul
 ## Purpose
 
 - **Change Detection**: Uses `terramate list --changed` to find modified stacks.
+  The change base is the **last successfully applied commit** (recorded by
+  `apply` as a GitLab generic package) when available, so stacks that were
+  planned but never applied are re-planned by the next pipeline instead of
+  being silently skipped. Falls back to the default branch when the marker is
+  missing.
 - **Speculative Previews**: Generates "Advisory" plans for Merge Requests. The plan is for viewing only. Another plan for planning will be created after MR is merged.
 - **Secure Plan Storage**: Utilize openssl to encrypt binary Terraform plans.
 - **Manual Promotion**: Ensures `apply` operations are gated by manual triggers.
@@ -139,6 +144,8 @@ saved plans), not a bug. Consequences and the accepted operating procedure:
 |----------|-------------|----------|
 | `TF_STATE_ARTIFACT_ENCRYPTION_KEY` | Passphrase used to encrypt/decrypt binary Terraform plan files. For this variable in GitLab, please remember to set protected and masked | Undefined |
 | `IAC_TERRAMATE_PLAN_EXTRA_FLAGS` | Extra flags for `terramate list --changed` in the plan jobs. Default `"--include-all-dependents --run-order"` (re-plan dependents of changed stacks; iterate in DAG execution order). Set to `""` to restore changed-stacks-only, path-order behaviour. | Optional (default provided) |
+| `IAC_LAST_APPLIED_REF_ENABLED` | Default `"true"`. `apply` records the applied commit SHA as a GitLab generic package (`IAC_LAST_APPLIED_PACKAGE`, default `iac-last-applied`); the plan jobs then use `terramate list --changed --git-ref <sha>` so everything committed since the last successful apply is re-planned. Requires `GITLAB_API_TOKEN`; without it both sides degrade to plain `--changed`. | Optional (default provided) |
+| `IAC_PLAN_JSON_SCAN_ENABLED` | Default `"true"`. Runs `checkov --framework terraform_plan` against each stack's resolved `terragrunt show -json` (the security stage's file-based scanners see no `.tf` in a Terragrunt repo). Advisory only. See `design/iac-security.md`. | Optional (default provided) |
 | `GITLAB_API_TOKEN` | Project or group access token (`api` scope, Maintainer/Owner role) used by `plan-mr-preview` to post the MR plan note, by `plan-main` to post the plan as a commit comment, and by `apply` to delete `plan-main` artifacts after a successful apply. If unset, note posting and artifact deletion are skipped (non-fatal). | Optional |
 | `DISABLE_IAM_POLICY_AUTOPILOT_TELEMETRY` | Defaults to `"true"` — opts out of iam-policy-autopilot telemetry. Highest precedence (beats the tool's persisted `~/.iam-policy-autopilot/config.json` choice); `telemetry --disable` is also run best-effort in the plan job. | Optional (default provided) |
 | `IAM_POLICY_AUTOPILOT_TO_MR_COMMENT` | Defaults to `"true"`. The generated IAM policies are always kept as `plan-mr-preview` artifacts; set to `"false"` to skip appending them to the MR plan note (large diffs -> huge MR comment). | Optional (default provided) |

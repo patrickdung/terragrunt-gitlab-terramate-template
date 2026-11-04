@@ -68,7 +68,12 @@ terragrunt-hcl-validate-use-prebuilt-container:
     - |
       set -euo pipefail
       terragrunt --version
-      terragrunt info print || true
+      # NOTE: do NOT run `terragrunt info print` here. It dumps the FULL
+      # resolved Terragrunt config (every local, every include, every
+      # dependency block) into the job log. Any local holding a SOPS-decoded
+      # value would be exposed in the trace, which is readable by anyone who
+      # can see the job. `hcl validate` is the actual check this job exists
+      # for; if you need the resolved config for debugging, run it locally.
       terragrunt hcl validate --all
 
 check-custom-kics:

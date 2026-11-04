@@ -2,6 +2,77 @@
 
 All notable changes to this template repository are documented in this file.
 
+## 2026-11-04
+
+### Fixed (some bug fixes and hardening)
+
+- **`templates/iac-plan-apply.yml`** — `resource_group` removed from
+  `.iac_template_plan_base`; it is now declared on `apply` only. A resource
+  group serializes every job that declares it across all pipelines, so having
+  it on the plan base made every MR's `plan-mr-preview` queue behind
+  `plan-main` and behind every other MR's preview — a pure throughput loss,
+  because planning does not mutate shared state. Per-stack state locking
+  (S3 `use_lockfile` / DynamoDB) already prevents concurrent state operations
+  on the same stack. Two applies must never overlap, so the group stays on
+  `apply`.
+- **`templates/iac-plan-apply.yml`** — `plan-mr-preview` artifacts now declare
+  `access: developer`, matching `plan-main`. The `reports/` directory holds
+  tfplan2md markdown and the `.plan.txt` fallback, both rendered from
+  `terragrunt show -json`, so they can carry resource attribute values.
+- **`templates/iac-plan-apply.yml`** — `_curl_or_warn` now turns an opaque
+  HTTP status into an actionable hint. A `401 {"error":"invalid_token"}` from
+  GitLab is the most common failure in practice and is **not** the same as an
+  expired token: a masked variable whose value does not match GitLab's masking
+  rules is substituted as an EMPTY string, and a protected variable is simply
+  absent in MR pipelines (`refs/merge-requests/...` is not a protected ref).
+  The hint lists the checks in order (masked → protected → stray whitespace →
+  expiry) plus `403` (role too low) and `404` (wrong project/MR id).
+- **`templates/iac-approval-gate.yml`** — `gl_api` now captures the fallback
+  attempt's stderr and prints **both** attempts clearly labelled, plus which
+  variable supplied the token (`GITLAB_API_TOKEN` vs
+  `IAC_APPROVAL_GITLAB_TOKEN`, never the token itself). Previously the log
+  only showed the job-token error (a 404 on `/approvals`, which is EXPECTED
+  and harmless on CE) and hid the real reason the fallback failed.
+- **`templates/iac-security.yml`** — `terragrunt info print || true` removed
+  from `terragrunt-hcl-validate-use-prebuilt-container`. It dumps the FULL
+  resolved Terragrunt config (every local, every include, every dependency
+  block) into the job log; any local holding a SOPS-decoded value would be
+  exposed in the trace. `terragrunt hcl validate --all` is the actual check
+  this job exists for.
+
+### Added (change detection and security coverage)
+
+- **`templates/iac-plan-apply.yml`** — last-applied ref tracking
+  (`IAC_LAST_APPLIED_REF_ENABLED`, default `"true"`;
+  `IAC_LAST_APPLIED_PACKAGE`, default `iac-last-applied`). Change detection is
+  git-based, so a stack that was planned but never applied is invisible to
+  later pipelines (drift). `apply` now records `CI_COMMIT_SHA` as a GitLab
+  generic package and both plan jobs use
+  `terramate list --changed --git-ref <sha>` (validated with
+  `git cat-file -e`), so everything committed since the last successful apply
+  is re-planned. Falls back to plain `--changed` when the marker is
+  unavailable or `GITLAB_API_TOKEN` is unset. Non-fatal on failure.
+- **`templates/iac-plan-apply.yml`** — plan-JSON security scan
+  (`IAC_PLAN_JSON_SCAN_ENABLED`, default `"true"`). The security stage's
+  scanners only see `.tf` files present in the consumer repo; a Terragrunt
+  repo has none (modules come from `terraform { source = ... }`), so that
+  stage passes vacuously. Both plan jobs now run
+  `checkov -f <stack>.show.json --framework terraform_plan` against each
+  stack's resolved `terragrunt show -json` output — real coverage of the
+  resources that would actually be created. Advisory only: findings never fail
+  the plan. Reports land in `.terragrunt-plans/reports/plan-scan/`; the raw
+  `.show.json` is deleted right after the scan and is never uploaded as an
+  artifact. Requires the `checkov` binary in `IAC_PIPELINE_IMAGE`; when absent
+  the scan is skipped with a `NOTE`.
+- **`design/iac-security.md`** — documents the "security stage scans almost
+  nothing in a Terragrunt repo" limitation and the two mitigations (plan-JSON
+  scan; scan the module source repos separately).
+- **`design/iac-plan-apply.md`** — change-base note in *Purpose* and the two
+  new variables in *Key Variables*.
+- **`design/iac-approval-gate.md`** — "Diagnosing fallback token also
+  rejected" table (401 / 403 / 404 / TLS), the token-source precedence note,
+  and the `read_api` scope requirement.
+
 ## 2026-10-19
 
 ### Added (IaC approval gate — CE-compatible MR approval enforcement)

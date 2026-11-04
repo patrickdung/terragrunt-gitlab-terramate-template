@@ -175,9 +175,37 @@ the gate on every run (`iac-approvers: ref=... commit=...`).
   required by `apply`); no extra variable.
 
 The gate logs which auth path served each call (`GL_API_AUTH`), and when a
-call fails for good it also prints why the job-token attempt was rejected
-(401 vs 404 vs TLS), so first-time wiring and token-rotation debugging are
-not guesswork.
+call fails for good it prints **both** attempts' stderr, clearly labelled:
+
+```
+ERROR: fallback token also rejected for: /projects/20/merge_requests/22/approvals
+       token source: IAC_APPROVAL_GITLAB_TOKEN (length 26, prefix glpa…)
+--- fallback attempt stderr (the REAL reason) ---
+curl: (22) The requested URL returned error: 401
+--- job-token attempt stderr (expected 404 on /approvals; not the cause) ---
+curl: (22) The requested URL returned error: 404
+```
+
+Read the **fallback** line, not the job-token line. The job-token 404 on
+`/approvals` is expected on CE and is never the cause of a gate failure.
+
+### Diagnosing "fallback token also rejected"
+
+| Fallback stderr | Meaning | Fix |
+|---|---|---|
+| `401` | Token invalid, expired, or revoked | Re-create the project access token; update the CI/CD variable |
+| `403` | Token valid but role too low | Give the token's user at least **Reporter** on the project |
+| `404` | Token cannot see the project, or `CI_PROJECT_ID` is wrong | Check the token's project scope; confirm the job runs in the consumer project |
+| `curl: (60)` / TLS | CA bundle problem | The gate's inline CA block did not pick up your CA — check `LOCAL_ROOT_CA_CERT_FILE` |
+
+The `token source` line tells you which variable was used. `GITLAB_API_TOKEN`
+takes precedence over `IAC_APPROVAL_GITLAB_TOKEN` — if both are set and the
+former is stale, the gate fails even though the latter is fine. Unset the one
+you are not using.
+
+**Scope note:** the token needs `read_api` (or `api`). `read_repository` alone
+is not enough — the approvals endpoint is part of the API surface, not the
+repository surface.
 
 ## Project settings checklist (per consumer repo)
 

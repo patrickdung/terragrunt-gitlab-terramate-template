@@ -37,3 +37,34 @@ Some reports are created / converted as:
 ## Workflow Impact
 
 These jobs run in the `security` stage. By default, they are allowed to fail (`allow_failure: true`) to avoid blocking pipelines on non-critical warnings, but they provide essential visibility during the Merge Request review process.
+
+## Known limitation: the security stage scans almost nothing in a Terragrunt repo
+
+Every scanner above (`tflint`, KICS, Terrascan, Checkov, Trivy) inspects
+**`.tf` files present in the checked-out repository**. A Terragrunt consumer
+repo typically contains **no `.tf` files at all** — modules are pulled at
+`terragrunt init` time via `terraform { source = "git::..." }` into
+`.terragrunt-cache/`, which the scanners skip (`.terraform`, `.terragrunt-cache`).
+The result is a stage that passes green while scanning nothing.
+
+Two mitigations are in place / recommended:
+
+1. **Plan-JSON scan (implemented, `IAC_PLAN_JSON_SCAN_ENABLED`, default
+   `"true"`).** Both plan jobs run
+   `checkov -f <stack>.show.json --framework terraform_plan` against the
+   resolved `terragrunt show -json` output — the only artifact that describes
+   the resources that would actually be created, including everything pulled
+   from remote modules. Reports land in
+   `.terragrunt-plans/reports/plan-scan/<stack>.checkov.json`. Advisory only:
+   findings never fail the plan. Requires the `checkov` binary in
+   `IAC_PIPELINE_IMAGE`; when absent the scan is skipped with a `NOTE`.
+   The raw `.show.json` is deleted right after the scan and is never uploaded
+   as an artifact.
+2. **Scan the module source repos separately.** The modules themselves are
+   plain Terraform and are best scanned where they live (their own pipelines),
+   not through the consumer's checkout.
+
+`terragrunt-hcl-validate-use-prebuilt-container` deliberately does **not** run
+`terragrunt info print`: it dumps the fully resolved Terragrunt config
+(including every local) into the job log, which would expose any SOPS-decoded
+value to anyone who can read the job trace.
