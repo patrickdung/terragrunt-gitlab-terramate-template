@@ -2,6 +2,42 @@
 
 All notable changes to this template repository are documented in this file.
 
+## 2026-11-06
+
+### Added (parallel `terragrunt init` pre-pass — ported from the upstream 0.16 branch)
+
+- **`templates/iac-plan-apply.yml`** — new variable `IAC_PLAN_INIT_PARALLEL`
+  (default `"3"`; set `"1"` or `"0"` to disable). Both plan jobs
+  (`plan-mr-preview`, `plan-main`) now run a parallel `terragrunt init`
+  pre-pass over the already-computed `CHANGED_STACKS` before the sequential
+  plan loop. `init` is the only plan-loop step that is safe to parallelise: it
+  touches only `.terragrunt-cache/` and `.terraform/` inside each stack and has
+  no cross-stack ordering requirement, while being the slowest step in a cold
+  pipeline (provider + module downloads). Plan, `show -json`, report
+  generation, encryption and manifest append stay sequential.
+  - **Not `terramate run --parallel`**: `terramate run` executes one command
+    per stack and re-derives the stack list itself, which would discard the
+    `--git-ref` change base. A plain background-job pool over the
+    already-computed list preserves the change base, DAG order and manifest
+    semantics exactly.
+  - **Per-stack logs** in `.terragrunt-plans/init-logs/<stack>.init.log`; on
+    failure the last 40 lines of each failing stack's log are printed and the
+    job exits non-zero.
+  - **Failure semantics improved**: an init failure now aborts *before* any
+    planning instead of mid-loop after earlier stacks were already planned —
+    no partial plan set is produced, and every failing stack is named, not just
+    the first.
+  - The plan loop still runs `init` when the pre-pass is disabled
+    (`INIT_DONE=false`), so the toggle is a pure performance switch.
+- **`design/iac-plan-apply.md`** — new *Parallelism* section: what
+  `terramate run --parallel` actually does, why it cannot replace the plan or
+  apply loops (multi-step per-stack shell logic; nondeterministic manifest
+  appends; `terragrunt apply <planfile>` re-renders config and can observe a
+  half-applied dependency), the implemented `init`-only pre-pass, the
+  "stacks must be independent" template invariant, and the remaining
+  throughput options (fix the provider cache; split the plan job by stack
+  group via GitLab `parallel:` + `CI_NODE_INDEX`).
+
 ## 2026-11-04
 
 ### Fixed (some bug fixes and hardening)

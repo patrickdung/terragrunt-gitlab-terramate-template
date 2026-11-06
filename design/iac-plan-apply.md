@@ -138,6 +138,130 @@ saved plans), not a bug. Consequences and the accepted operating procedure:
   `mock_outputs_allowed_terraform_commands`, so it only affects plan-like
   commands, never apply.
 
+## Parallelism (investigated — only `init` parallelised)
+
+Status: **investigated 2026-11-05.** The plan and apply loops remain
+sequential; only `terragrunt init` runs in a parallel pre-pass. This section
+records why, so the question does not get re-opened without new information.
+
+### What `terramate run --parallel` actually does
+
+`terramate run --parallel <n>` (alias `-j <n>`) runs **independent stacks in
+parallel**. It is a DAG-aware scheduler, not a "run my loop N times" flag: it
+walks the dependency graph and starts a stack only once its dependencies have
+finished, up to `<n>` concurrently. DAG ordering is therefore preserved, not
+bypassed — `c` still waits for `a` and `b`.
+
+It executes **one command per stack**. It has no concept of a multi-step
+per-stack shell sequence with derived variables.
+
+### Why it cannot replace the plan loop
+
+The plan loop is not `terragrunt plan`. Per stack it runs, in order:
+
+1. `terragrunt init -reconfigure`
+2. `terragrunt plan -out <file>`
+3. `terragrunt show -json <file>` — feeds tf-summarize, tfplan2md,
+   iam-policy-autopilot and the change-summary projection
+4. Six report generators
+5. `openssl enc` → `<stack>.tfplan.enc`
+6. Append `<stack>|<path>` to `plan-manifest.txt`
+
+Steps 3–6 are shell logic over per-stack variables (`safe_module_name`,
+`module_plan_file`, …). Adopting `--parallel` would mean extracting the whole
+body into a script and calling
+`terramate run --parallel N -- ./plan-one-stack.sh` — a rewrite, not a flag.
+
+**Manifest ordering is the second blocker.** `plan-main` writes
+`plan-manifest.txt` in DAG order and `apply` consumes it in that order. Under
+`--parallel`, stacks finish nondeterministically, so appends to a shared file
+interleave arbitrarily. Fixing that needs per-stack manifest fragments plus a
+post-run sort against `terramate list --run-order`.
+
+### Why it cannot replace the apply loop
+
+The apply loop decrypts a plan whose path comes from the **manifest**, not
+from a convention `terramate run` can derive:
+
+```sh
+openssl enc -d ... -in "${module_plan_encrypted_file}" -out "${module_plan_file}"
+cd "${module_dir}"
+terragrunt apply "${module_plan_file}"
+```
+
+More importantly, `terragrunt apply <planfile>` **re-renders the Terragrunt
+config** and compares the result against the plan's baked variables (see
+*First-time deploy of a dependency chain* above). Parallelism makes that
+worse, not better: a dependency and its dependent can be in flight at the
+same time, so the dependent's re-render can observe a half-applied
+dependency. The sequential loop at least guarantees the dependency finished
+before the dependent starts.
+
+### The one place `--parallel` is safe — and what was implemented instead
+
+**`terragrunt init`.** It touches only `.terragrunt-cache/` and `.terraform/`
+inside each stack, has no cross-stack ordering requirement, and is the
+slowest step in a cold pipeline (provider downloads).
+
+**Implemented** as a parallel pre-pass in both plan jobs, controlled by
+`IAC_PLAN_INIT_PARALLEL` (default `"3"`; set `"1"` or `"0"` to disable and
+restore in-loop init):
+
+```sh
+# for each changed stack, in the background, up to N at a time:
+( cd "${TF_ROOT}/${stack}" && terragrunt init -reconfigure ) > "${log}" 2>&1 &
+# reap oldest-first with `wait <pid>` so failures are attributed per stack
+```
+
+Design notes:
+
+- **Not `terramate run --parallel`.** `terramate run` executes one command per
+  stack and re-derives the stack list itself, which would discard the
+  `--git-ref` change base computed above. A plain background-job pool over the
+  already-computed `CHANGED_STACKS` preserves the change base, the DAG order
+  and the manifest semantics exactly.
+- **Per-stack logs** land in `.terragrunt-plans/init-logs/<stack>.init.log`;
+  on failure the last 40 lines of each failing stack's log are printed and the
+  job exits non-zero.
+- **Failure semantics change (for the better).** An init failure now aborts
+  *before* any planning, instead of mid-loop after earlier stacks were already
+  planned. No partial plan set is produced, and every failing stack is named —
+  not just the first.
+- **The plan loop still runs `init`** when the pre-pass is disabled
+  (`INIT_DONE=false`), so the toggle is a pure performance switch with no
+  behavioural difference beyond the abort point.
+
+### Template invariant: stacks must be independent
+
+The template assumes stacks are **independent for planning** (each plan is
+self-contained) and **ordered for applying** (DAG). The invariant consumers
+must uphold:
+
+> Stacks must not share mutable state outside their own backend. Two stacks
+> writing to the same S3 bucket, the same IAM role, or the same DNS record
+> produce plans that are individually valid but mutually destructive when
+> applied in sequence. The template cannot detect this; it is a consumer
+> responsibility.
+
+This is the real content of the parallelism question: the loops are
+sequential not because parallelism is unimplemented, but because the
+saved-plan model (plan once → apply exactly what was reviewed) requires
+deterministic order and explicit per-stack artifacts.
+
+### If throughput becomes a problem
+
+In order of leverage:
+
+1. **Fix the provider cache.** `$HOME/.cache/terragrunt/providers` may be
+   dead weight (the common layout is per-module `.terragrunt-cache`). Fixing
+   it removes most of the cold-start cost that `--parallel` would have
+   bought.
+2. **Parallelise `terragrunt init` only** — implemented, see above.
+3. **Split the plan job by stack group** — GitLab `parallel:` with
+   `CI_NODE_INDEX`, each node planning a disjoint slice. Preserves
+   determinism per slice and gives real concurrency, but needs manifest
+   merging.
+
 ## Key Variables
 
 | Variable | Description | Required |
@@ -146,6 +270,7 @@ saved plans), not a bug. Consequences and the accepted operating procedure:
 | `IAC_TERRAMATE_PLAN_EXTRA_FLAGS` | Extra flags for `terramate list --changed` in the plan jobs. Default `"--include-all-dependents --run-order"` (re-plan dependents of changed stacks; iterate in DAG execution order). Set to `""` to restore changed-stacks-only, path-order behaviour. | Optional (default provided) |
 | `IAC_LAST_APPLIED_REF_ENABLED` | Default `"true"`. `apply` records the applied commit SHA as a GitLab generic package (`IAC_LAST_APPLIED_PACKAGE`, default `iac-last-applied`); the plan jobs then use `terramate list --changed --git-ref <sha>` so everything committed since the last successful apply is re-planned. Requires `GITLAB_API_TOKEN`; without it both sides degrade to plain `--changed`. | Optional (default provided) |
 | `IAC_PLAN_JSON_SCAN_ENABLED` | Default `"true"`. Runs `checkov --framework terraform_plan` against each stack's resolved `terragrunt show -json` (the security stage's file-based scanners see no `.tf` in a Terragrunt repo). Advisory only. See `design/iac-security.md`. | Optional (default provided) |
+| `IAC_PLAN_INIT_PARALLEL` | Default `"3"`. Number of stacks whose `terragrunt init` runs concurrently in the plan jobs' pre-pass. `init` is the only plan-loop step safe to parallelise. Set `"1"` or `"0"` to disable and restore in-loop init. See *Parallelism*. | Optional (default provided) |
 | `GITLAB_API_TOKEN` | Project or group access token (`api` scope, Maintainer/Owner role) used by `plan-mr-preview` to post the MR plan note, by `plan-main` to post the plan as a commit comment, and by `apply` to delete `plan-main` artifacts after a successful apply. If unset, note posting and artifact deletion are skipped (non-fatal). | Optional |
 | `DISABLE_IAM_POLICY_AUTOPILOT_TELEMETRY` | Defaults to `"true"` — opts out of iam-policy-autopilot telemetry. Highest precedence (beats the tool's persisted `~/.iam-policy-autopilot/config.json` choice); `telemetry --disable` is also run best-effort in the plan job. | Optional (default provided) |
 | `IAM_POLICY_AUTOPILOT_TO_MR_COMMENT` | Defaults to `"true"`. The generated IAM policies are always kept as `plan-mr-preview` artifacts; set to `"false"` to skip appending them to the MR plan note (large diffs -> huge MR comment). | Optional (default provided) |

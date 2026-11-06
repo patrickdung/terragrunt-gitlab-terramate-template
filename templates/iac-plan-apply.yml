@@ -59,6 +59,13 @@ include:
     IAC_LAST_APPLIED_REF_ENABLED: "true"
     # Name of the generic package that stores the last-applied SHA.
     IAC_LAST_APPLIED_PACKAGE: "iac-last-applied"
+    # Parallel `terragrunt init` pre-pass in the plan jobs. `init` is the only
+    # plan-loop step that is safe to parallelise (it touches only
+    # .terragrunt-cache/ and .terraform/ inside each stack, no cross-stack
+    # ordering). Default "3" = up to 3 stacks initialising at once. Set to
+    # "1" or "0" to disable and restore in-loop init. Plan/apply themselves
+    # stay sequential — see design/iac-plan-apply.md "Parallelism".
+    IAC_PLAN_INIT_PARALLEL: "3"
   before_script:
     - |
       set -euo pipefail
@@ -560,6 +567,103 @@ plan-mr-preview:
 
       echo "Changed stacks to plan:"
       echo "${CHANGED_STACKS}"
+
+      # --- Parallel `terragrunt init` pre-pass ------------------------------
+      # `init` is the only step in the plan loop that is safe to parallelise:
+      # it touches only .terragrunt-cache/ and .terraform/ INSIDE each stack,
+      # has no cross-stack ordering requirement, and is the slowest step in a
+      # cold pipeline (provider + module downloads). Everything after it
+      # (plan, show -json, report generation, encryption, manifest append)
+      # stays sequential — see design/iac-plan-apply.md "Parallelism".
+      #
+      # Why a separate pre-pass instead of `terramate run --parallel`:
+      #   * terramate run executes ONE command per stack; the plan loop is a
+      #     multi-step shell sequence with per-stack derived variables.
+      #   * terramate run re-derives the stack list itself, which would ignore
+      #     the --git-ref change base computed above.
+      # A plain background-job pool over the already-computed CHANGED_STACKS
+      # keeps the change base, the DAG order and the manifest semantics
+      # exactly as they are.
+      #
+      # Failure semantics: an init failure now aborts BEFORE any planning
+      # (previously it aborted mid-loop, after earlier stacks were planned).
+      # That is strictly better — no partial plan set is produced — and the
+      # job log names every failing stack, not just the first.
+      #
+      # Set IAC_PLAN_INIT_PARALLEL=1 to disable (restores in-loop init).
+      if [ "${IAC_PLAN_INIT_PARALLEL:-3}" != "1" ] && [ "${IAC_PLAN_INIT_PARALLEL:-3}" != "0" ]; then
+        init_jobs="${IAC_PLAN_INIT_PARALLEL:-3}"
+        echo "Parallel init pre-pass: up to ${init_jobs} stack(s) at a time"
+        init_log_dir="${PLAN_ROOT}/init-logs"
+        mkdir -p "${init_log_dir}"
+        # Queue of "pid|stack|log" entries, newline-separated. A space-separated
+        # string would yield an empty first element from the leading space and
+        # break `wait`. Reaped oldest-first so failures are attributed per stack.
+        init_queue=""
+        init_failed=""
+        init_running=0
+        while IFS= read -r rel_module_dir; do
+          [ -n "${rel_module_dir}" ] || continue
+          init_safe="$(echo "${rel_module_dir}" | sed 's#[/ ]#_#g')"
+          init_log="${init_log_dir}/${init_safe}.init.log"
+          (
+            cd "${TF_ROOT}/${rel_module_dir}" || exit 1
+            terragrunt init -reconfigure
+          ) > "${init_log}" 2>&1 &
+          init_entry="$!|${rel_module_dir}|${init_log}"
+          if [ -n "${init_queue}" ]; then
+            init_queue="${init_queue}"$'\n'"${init_entry}"
+          else
+            init_queue="${init_entry}"
+          fi
+          init_running=$((init_running + 1))
+          if [ "${init_running}" -ge "${init_jobs}" ]; then
+            oldest="${init_queue%%$'\n'*}"
+            if [ "${oldest}" = "${init_queue}" ]; then init_queue=""; else init_queue="${init_queue#*$'\n'}"; fi
+            init_running=$((init_running - 1))
+            pid="${oldest%%|*}"
+            rest="${oldest#*|}"
+            stack="${rest%%|*}"
+            log="${rest#*|}"
+            if wait "${pid}"; then
+              echo "  init OK: ${stack}"
+            else
+              echo "  init FAILED: ${stack} (log: ${log})"
+              init_failed="${init_failed} ${stack}"
+            fi
+          fi
+        done <<< "${CHANGED_STACKS}"
+        # Drain the remaining jobs.
+        while [ -n "${init_queue}" ]; do
+          oldest="${init_queue%%$'\n'*}"
+          if [ "${oldest}" = "${init_queue}" ]; then init_queue=""; else init_queue="${init_queue#*$'\n'}"; fi
+          pid="${oldest%%|*}"
+          rest="${oldest#*|}"
+          stack="${rest%%|*}"
+          log="${rest#*|}"
+          if wait "${pid}"; then
+            echo "  init OK: ${stack}"
+          else
+            echo "  init FAILED: ${stack} (log: ${log})"
+            init_failed="${init_failed} ${stack}"
+          fi
+        done
+        if [ -n "${init_failed}" ]; then
+          echo "ERROR: terragrunt init failed for:${init_failed}"
+          for stack in ${init_failed}; do
+            init_safe="$(echo "${stack}" | sed 's#[/ ]#_#g')"
+            echo "--- init log: ${stack} ---"
+            tail -n 40 "${init_log_dir}/${init_safe}.init.log" 2>/dev/null || true
+          done
+          exit 1
+        fi
+        echo "Parallel init pre-pass complete."
+        INIT_DONE="true"
+      else
+        echo "Parallel init pre-pass disabled (IAC_PLAN_INIT_PARALLEL=${IAC_PLAN_INIT_PARALLEL:-}); init runs inside the plan loop."
+        INIT_DONE="false"
+      fi
+
       while IFS= read -r rel_module_dir; do
         module_dir="${TF_ROOT}/${rel_module_dir}"
         safe_module_name="$(echo "${rel_module_dir}" | sed 's#[/ ]#_#g')"
@@ -575,7 +679,11 @@ plan-mr-preview:
         echo "Planning stack: ${rel_module_dir}"
         (
           cd "${module_dir}"
-          terragrunt init -reconfigure
+          # init already ran in the parallel pre-pass (INIT_DONE=true).
+          # Only run it here when the pre-pass was disabled.
+          if [ "${INIT_DONE:-false}" != "true" ]; then
+            terragrunt init -reconfigure
+          fi
 
           plan_extra_args=()
           if grep -R --include='*.tf' -nE '^[[:space:]]*variable[[:space:]]+"tf_state_name"' . >/dev/null 2>&1; then
@@ -821,6 +929,102 @@ plan-main:
       echo "Changed stacks to plan:"
       echo "${CHANGED_STACKS}"
 
+      # --- Parallel `terragrunt init` pre-pass ------------------------------
+      # `init` is the only step in the plan loop that is safe to parallelise:
+      # it touches only .terragrunt-cache/ and .terraform/ INSIDE each stack,
+      # has no cross-stack ordering requirement, and is the slowest step in a
+      # cold pipeline (provider + module downloads). Everything after it
+      # (plan, show -json, report generation, encryption, manifest append)
+      # stays sequential — see design/iac-plan-apply.md "Parallelism".
+      #
+      # Why a separate pre-pass instead of `terramate run --parallel`:
+      #   * terramate run executes ONE command per stack; the plan loop is a
+      #     multi-step shell sequence with per-stack derived variables.
+      #   * terramate run re-derives the stack list itself, which would ignore
+      #     the --git-ref change base computed above.
+      # A plain background-job pool over the already-computed CHANGED_STACKS
+      # keeps the change base, the DAG order and the manifest semantics
+      # exactly as they are.
+      #
+      # Failure semantics: an init failure now aborts BEFORE any planning
+      # (previously it aborted mid-loop, after earlier stacks were planned).
+      # That is strictly better — no partial plan set is produced — and the
+      # job log names every failing stack, not just the first.
+      #
+      # Set IAC_PLAN_INIT_PARALLEL=1 to disable (restores in-loop init).
+      if [ "${IAC_PLAN_INIT_PARALLEL:-3}" != "1" ] && [ "${IAC_PLAN_INIT_PARALLEL:-3}" != "0" ]; then
+        init_jobs="${IAC_PLAN_INIT_PARALLEL:-3}"
+        echo "Parallel init pre-pass: up to ${init_jobs} stack(s) at a time"
+        init_log_dir="${PLAN_ROOT}/init-logs"
+        mkdir -p "${init_log_dir}"
+        # Queue of "pid|stack|log" entries, newline-separated. A space-separated
+        # string would yield an empty first element from the leading space and
+        # break `wait`. Reaped oldest-first so failures are attributed per stack.
+        init_queue=""
+        init_failed=""
+        init_running=0
+        while IFS= read -r rel_module_dir; do
+          [ -n "${rel_module_dir}" ] || continue
+          init_safe="$(echo "${rel_module_dir}" | sed 's#[/ ]#_#g')"
+          init_log="${init_log_dir}/${init_safe}.init.log"
+          (
+            cd "${TF_ROOT}/${rel_module_dir}" || exit 1
+            terragrunt init -reconfigure
+          ) > "${init_log}" 2>&1 &
+          init_entry="$!|${rel_module_dir}|${init_log}"
+          if [ -n "${init_queue}" ]; then
+            init_queue="${init_queue}"$'\n'"${init_entry}"
+          else
+            init_queue="${init_entry}"
+          fi
+          init_running=$((init_running + 1))
+          if [ "${init_running}" -ge "${init_jobs}" ]; then
+            oldest="${init_queue%%$'\n'*}"
+            if [ "${oldest}" = "${init_queue}" ]; then init_queue=""; else init_queue="${init_queue#*$'\n'}"; fi
+            init_running=$((init_running - 1))
+            pid="${oldest%%|*}"
+            rest="${oldest#*|}"
+            stack="${rest%%|*}"
+            log="${rest#*|}"
+            if wait "${pid}"; then
+              echo "  init OK: ${stack}"
+            else
+              echo "  init FAILED: ${stack} (log: ${log})"
+              init_failed="${init_failed} ${stack}"
+            fi
+          fi
+        done <<< "${CHANGED_STACKS}"
+        # Drain the remaining jobs.
+        while [ -n "${init_queue}" ]; do
+          oldest="${init_queue%%$'\n'*}"
+          if [ "${oldest}" = "${init_queue}" ]; then init_queue=""; else init_queue="${init_queue#*$'\n'}"; fi
+          pid="${oldest%%|*}"
+          rest="${oldest#*|}"
+          stack="${rest%%|*}"
+          log="${rest#*|}"
+          if wait "${pid}"; then
+            echo "  init OK: ${stack}"
+          else
+            echo "  init FAILED: ${stack} (log: ${log})"
+            init_failed="${init_failed} ${stack}"
+          fi
+        done
+        if [ -n "${init_failed}" ]; then
+          echo "ERROR: terragrunt init failed for:${init_failed}"
+          for stack in ${init_failed}; do
+            init_safe="$(echo "${stack}" | sed 's#[/ ]#_#g')"
+            echo "--- init log: ${stack} ---"
+            tail -n 40 "${init_log_dir}/${init_safe}.init.log" 2>/dev/null || true
+          done
+          exit 1
+        fi
+        echo "Parallel init pre-pass complete."
+        INIT_DONE="true"
+      else
+        echo "Parallel init pre-pass disabled (IAC_PLAN_INIT_PARALLEL=${IAC_PLAN_INIT_PARALLEL:-}); init runs inside the plan loop."
+        INIT_DONE="false"
+      fi
+
       while IFS= read -r rel_module_dir; do
         module_dir="${TF_ROOT}/${rel_module_dir}"
         safe_module_name="$(echo "${rel_module_dir}" | sed 's#[/ ]#_#g')"
@@ -837,7 +1041,11 @@ plan-main:
         echo "Planning module: ${rel_module_dir}"
         (
           cd "${module_dir}"
-          terragrunt init -reconfigure
+          # init already ran in the parallel pre-pass (INIT_DONE=true).
+          # Only run it here when the pre-pass was disabled.
+          if [ "${INIT_DONE:-false}" != "true" ]; then
+            terragrunt init -reconfigure
+          fi
 
           plan_extra_args=()
           if grep -R --include='*.tf' -nE '^[[:space:]]*variable[[:space:]]+"tf_state_name"' . >/dev/null 2>&1; then
