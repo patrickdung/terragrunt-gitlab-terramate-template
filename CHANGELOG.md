@@ -2,6 +2,46 @@
 
 All notable changes to this template repository are documented in this file.
 
+## 2026-11-07
+
+### Fixed (last-applied marker was uploaded as multipart — feature was a silent no-op)
+
+- **`templates/iac-plan-apply.yml`** — `apply` published the last-applied
+  commit SHA with `curl --form "file=@..."`, which sends
+  `multipart/form-data`. GitLab's generic-packages publish endpoint stores the
+  request body **verbatim** and does not parse multipart, so the stored file
+  contained the MIME boundary and part headers alongside the SHA. The failure
+  was silent in both directions: the PUT still returned `201` and `apply`
+  logged "Last-applied ref recorded", while the plan jobs' read returned
+  boundary garbage → `git cat-file -e` failed → fallback to plain
+  `--changed` — i.e. exactly the drift the feature exists to prevent.
+  Fixed by using the documented raw-body method, `--upload-file`, instead.
+  Verified against the GitLab generic-packages docs
+  (`curl --header "PRIVATE-TOKEN: <token>" --upload-file file.txt ...`).
+- **`templates/iac-plan-apply.yml`** — the read side in both plan jobs is now
+  strict and loud. Instead of `head -n 1`, the marker is parsed with
+  `grep -oE '\b[0-9a-f]{40}\b'`, and the three states are distinguished:
+  - valid SHA present in the repo → `Change base: last successfully applied commit <sha>`
+  - marker present but no valid SHA → **`WARNING`** with the first 120 bytes
+    of the marker and a hint that it looks like a MIME boundary (i.e. it was
+    uploaded with `--form`; re-run `apply` to rewrite it)
+  - marker absent → `NOTE: no last-applied ref recorded yet`
+
+  Previously all three collapsed into one quiet `NOTE`, which is why the
+  upload bug went unnoticed. As a side effect the regex also salvages a SHA
+  from a marker already corrupted by an older template version, so existing
+  bad markers self-heal on read.
+- **`templates/iac-plan-apply.yml`** — the change-base flag was
+  `--git-ref`, which **does not exist** in Terramate. The correct flag is
+  `--git-change-base` (verified against Terramate 0.17.3:
+  `-B, --git-change-base=STRING  Set git base reference for computing changes`).
+  With the wrong flag the plan jobs would have failed outright rather than
+  silently degrading. All occurrences (code, comments, design doc, changelog)
+  renamed.
+- **`design/iac-plan-apply.md`** — documented the raw-body requirement and
+  the silent-failure mode in the `IAC_LAST_APPLIED_REF_ENABLED` row of
+  *Key Variables*.
+
 ## 2026-11-06
 
 ### Added (parallel `terragrunt init` pre-pass — ported from the upstream 0.16 branch)
@@ -17,7 +57,7 @@ All notable changes to this template repository are documented in this file.
   generation, encryption and manifest append stay sequential.
   - **Not `terramate run --parallel`**: `terramate run` executes one command
     per stack and re-derives the stack list itself, which would discard the
-    `--git-ref` change base. A plain background-job pool over the
+    `--git-change-base` change base. A plain background-job pool over the
     already-computed list preserves the change base, DAG order and manifest
     semantics exactly.
   - **Per-stack logs** in `.terragrunt-plans/init-logs/<stack>.init.log`; on
@@ -84,7 +124,7 @@ All notable changes to this template repository are documented in this file.
   git-based, so a stack that was planned but never applied is invisible to
   later pipelines (drift). `apply` now records `CI_COMMIT_SHA` as a GitLab
   generic package and both plan jobs use
-  `terramate list --changed --git-ref <sha>` (validated with
+  `terramate list --changed --git-change-base <sha>` (validated with
   `git cat-file -e`), so everything committed since the last successful apply
   is re-planned. Falls back to plain `--changed` when the marker is
   unavailable or `GITLAB_API_TOKEN` is unset. Non-fatal on failure.

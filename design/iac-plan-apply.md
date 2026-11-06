@@ -217,7 +217,7 @@ Design notes:
 
 - **Not `terramate run --parallel`.** `terramate run` executes one command per
   stack and re-derives the stack list itself, which would discard the
-  `--git-ref` change base computed above. A plain background-job pool over the
+  `--git-change-base` change base computed above. A plain background-job pool over the
   already-computed `CHANGED_STACKS` preserves the change base, the DAG order
   and the manifest semantics exactly.
 - **Per-stack logs** land in `.terragrunt-plans/init-logs/<stack>.init.log`;
@@ -268,7 +268,7 @@ In order of leverage:
 |----------|-------------|----------|
 | `TF_STATE_ARTIFACT_ENCRYPTION_KEY` | Passphrase used to encrypt/decrypt binary Terraform plan files. For this variable in GitLab, please remember to set protected and masked | Undefined |
 | `IAC_TERRAMATE_PLAN_EXTRA_FLAGS` | Extra flags for `terramate list --changed` in the plan jobs. Default `"--include-all-dependents --run-order"` (re-plan dependents of changed stacks; iterate in DAG execution order). Set to `""` to restore changed-stacks-only, path-order behaviour. | Optional (default provided) |
-| `IAC_LAST_APPLIED_REF_ENABLED` | Default `"true"`. `apply` records the applied commit SHA as a GitLab generic package (`IAC_LAST_APPLIED_PACKAGE`, default `iac-last-applied`); the plan jobs then use `terramate list --changed --git-ref <sha>` so everything committed since the last successful apply is re-planned. Requires `GITLAB_API_TOKEN`; without it both sides degrade to plain `--changed`. | Optional (default provided) |
+| `IAC_LAST_APPLIED_REF_ENABLED` | Default `"true"`. `apply` records the applied commit SHA as a GitLab generic package (`IAC_LAST_APPLIED_PACKAGE`, default `iac-last-applied`); the plan jobs then use `terramate list --changed --git-change-base <sha>` so everything committed since the last successful apply is re-planned. Requires `GITLAB_API_TOKEN`; without it both sides degrade to plain `--changed`. The marker is published with `curl --upload-file` (raw body) — **not** `--form`, which would store a multipart body and silently break the read side. | Optional (default provided) |
 | `IAC_PLAN_JSON_SCAN_ENABLED` | Default `"true"`. Runs `checkov --framework terraform_plan` against each stack's resolved `terragrunt show -json` (the security stage's file-based scanners see no `.tf` in a Terragrunt repo). Advisory only. See `design/iac-security.md`. | Optional (default provided) |
 | `IAC_PLAN_INIT_PARALLEL` | Default `"3"`. Number of stacks whose `terragrunt init` runs concurrently in the plan jobs' pre-pass. `init` is the only plan-loop step safe to parallelise. Set `"1"` or `"0"` to disable and restore in-loop init. See *Parallelism*. | Optional (default provided) |
 | `GITLAB_API_TOKEN` | Project or group access token (`api` scope, Maintainer/Owner role) used by `plan-mr-preview` to post the MR plan note, by `plan-main` to post the plan as a commit comment, and by `apply` to delete `plan-main` artifacts after a successful apply. If unset, note posting and artifact deletion are skipped (non-fatal). | Optional |

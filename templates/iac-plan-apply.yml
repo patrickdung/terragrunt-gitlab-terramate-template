@@ -52,7 +52,7 @@ include:
     # that was planned but never applied is invisible to later pipelines
     # (drift). When "true" (default), `apply` records the applied commit SHA
     # as a GitLab generic package and the plan jobs use
-    # `terramate list --changed --git-ref <sha>` so everything committed
+    # `terramate list --changed --git-change-base <sha>` so everything committed
     # since the last successful apply is re-planned. Requires
     # GITLAB_API_TOKEN (already required by apply); without it both sides
     # degrade to plain --changed.
@@ -542,21 +542,34 @@ plan-mr-preview:
       # `--changed` on the default branch compares against the branch tip,
       # which can resolve to an EMPTY set — and a stack that was planned but
       # never applied is then invisible to every later pipeline (drift).
-      # `--git-ref <last-applied>` re-plans everything committed since the
+      # `--git-change-base <last-applied>` re-plans everything committed since the
       # last successful apply, which is exactly the set that may be unapplied.
       # Falls back to plain --changed when the marker is unavailable.
       CHANGE_BASE_ARGS=""
       if [ "${IAC_LAST_APPLIED_REF_ENABLED:-true}" = "true" ] && [ -n "${GITLAB_API_TOKEN:-}" ]; then
         last_applied_pkg="${IAC_LAST_APPLIED_PACKAGE:-iac-last-applied}"
-        last_applied_sha="$(curl --silent --fail \
+        # The marker is a single line containing a 40-char commit SHA. Extract
+        # it with a strict regex rather than `head -n 1`: if the stored file is
+        # ever corrupt (e.g. a multipart body from a bad upload), the first
+        # line is a MIME boundary, not a SHA. A strict match turns that into a
+        # loud WARNING instead of a silent fallback to --changed.
+        last_applied_raw="$(curl --silent --fail \
             --header "PRIVATE-TOKEN: ${GITLAB_API_TOKEN}" \
             "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${last_applied_pkg}/latest/last-applied-sha.txt" \
-          2>/dev/null | head -n 1 | tr -d '[:space:]' || true)"
+          2>/dev/null || true)"
+        last_applied_sha="$(printf '%s' "${last_applied_raw}" \
+          | grep -oE '\b[0-9a-f]{40}\b' | head -n 1 || true)"
         if [ -n "${last_applied_sha}" ] && git cat-file -e "${last_applied_sha}^{commit}" 2>/dev/null; then
           echo "Change base: last successfully applied commit ${last_applied_sha}"
-          CHANGE_BASE_ARGS="--git-ref ${last_applied_sha}"
+          CHANGE_BASE_ARGS="--git-change-base ${last_applied_sha}"
+        elif [ -n "${last_applied_raw}" ]; then
+          echo "WARNING: last-applied marker is present but contains no valid commit SHA."
+          echo "         First 120 bytes: $(printf '%s' "${last_applied_raw}" | head -c 120 | tr '\n' ' ')"
+          echo "         Falling back to the default --changed base. If this looks like a"
+          echo "         MIME boundary, the marker was uploaded with --form instead of"
+          echo "         --upload-file; re-run apply to rewrite it."
         else
-          echo "NOTE: no usable last-applied ref (got '${last_applied_sha:-<none>}'); using default --changed base."
+          echo "NOTE: no last-applied ref recorded yet; using default --changed base."
         fi
       fi
       CHANGED_STACKS="$(terramate list --changed ${CHANGE_BASE_ARGS} ${IAC_TERRAMATE_PLAN_EXTRA_FLAGS})"
@@ -580,7 +593,7 @@ plan-mr-preview:
       #   * terramate run executes ONE command per stack; the plan loop is a
       #     multi-step shell sequence with per-stack derived variables.
       #   * terramate run re-derives the stack list itself, which would ignore
-      #     the --git-ref change base computed above.
+      #     the --git-change-base change base computed above.
       # A plain background-job pool over the already-computed CHANGED_STACKS
       # keeps the change base, the DAG order and the manifest semantics
       # exactly as they are.
@@ -904,21 +917,34 @@ plan-main:
       # `--changed` on the default branch compares against the branch tip,
       # which can resolve to an EMPTY set — and a stack that was planned but
       # never applied is then invisible to every later pipeline (drift).
-      # `--git-ref <last-applied>` re-plans everything committed since the
+      # `--git-change-base <last-applied>` re-plans everything committed since the
       # last successful apply, which is exactly the set that may be unapplied.
       # Falls back to plain --changed when the marker is unavailable.
       CHANGE_BASE_ARGS=""
       if [ "${IAC_LAST_APPLIED_REF_ENABLED:-true}" = "true" ] && [ -n "${GITLAB_API_TOKEN:-}" ]; then
         last_applied_pkg="${IAC_LAST_APPLIED_PACKAGE:-iac-last-applied}"
-        last_applied_sha="$(curl --silent --fail \
+        # The marker is a single line containing a 40-char commit SHA. Extract
+        # it with a strict regex rather than `head -n 1`: if the stored file is
+        # ever corrupt (e.g. a multipart body from a bad upload), the first
+        # line is a MIME boundary, not a SHA. A strict match turns that into a
+        # loud WARNING instead of a silent fallback to --changed.
+        last_applied_raw="$(curl --silent --fail \
             --header "PRIVATE-TOKEN: ${GITLAB_API_TOKEN}" \
             "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${last_applied_pkg}/latest/last-applied-sha.txt" \
-          2>/dev/null | head -n 1 | tr -d '[:space:]' || true)"
+          2>/dev/null || true)"
+        last_applied_sha="$(printf '%s' "${last_applied_raw}" \
+          | grep -oE '\b[0-9a-f]{40}\b' | head -n 1 || true)"
         if [ -n "${last_applied_sha}" ] && git cat-file -e "${last_applied_sha}^{commit}" 2>/dev/null; then
           echo "Change base: last successfully applied commit ${last_applied_sha}"
-          CHANGE_BASE_ARGS="--git-ref ${last_applied_sha}"
+          CHANGE_BASE_ARGS="--git-change-base ${last_applied_sha}"
+        elif [ -n "${last_applied_raw}" ]; then
+          echo "WARNING: last-applied marker is present but contains no valid commit SHA."
+          echo "         First 120 bytes: $(printf '%s' "${last_applied_raw}" | head -c 120 | tr '\n' ' ')"
+          echo "         Falling back to the default --changed base. If this looks like a"
+          echo "         MIME boundary, the marker was uploaded with --form instead of"
+          echo "         --upload-file; re-run apply to rewrite it."
         else
-          echo "NOTE: no usable last-applied ref (got '${last_applied_sha:-<none>}'); using default --changed base."
+          echo "NOTE: no last-applied ref recorded yet; using default --changed base."
         fi
       fi
       CHANGED_STACKS="$(terramate list --changed ${CHANGE_BASE_ARGS} ${IAC_TERRAMATE_PLAN_EXTRA_FLAGS})"
@@ -941,7 +967,7 @@ plan-main:
       #   * terramate run executes ONE command per stack; the plan loop is a
       #     multi-step shell sequence with per-stack derived variables.
       #   * terramate run re-derives the stack list itself, which would ignore
-      #     the --git-ref change base computed above.
+      #     the --git-change-base change base computed above.
       # A plain background-job pool over the already-computed CHANGED_STACKS
       # keeps the change base, the DAG order and the manifest semantics
       # exactly as they are.
@@ -1475,7 +1501,7 @@ apply:
       # applied is invisible to the NEXT pipeline: the next merge's diff does
       # not touch it, so it is not re-planned and the change is silently lost
       # (drift). Writing the applied SHA here lets the plan jobs use
-      # `terramate list --git-ref <sha>` so anything committed since the last
+      # `terramate list --git-change-base <sha>` so anything committed since the last
       # successful apply is re-planned automatically.
       #
       # Storage: a GitLab generic package (no extra infrastructure, survives
@@ -1486,9 +1512,19 @@ apply:
           last_applied_pkg="${IAC_LAST_APPLIED_PACKAGE:-iac-last-applied}"
           echo "Recording last-applied ref ${CI_COMMIT_SHA} (package ${last_applied_pkg})..."
           printf '%s\n' "${CI_COMMIT_SHA}" > /tmp/last-applied-sha.txt
+          # --upload-file (raw body), NOT --form. The generic-packages publish
+          # endpoint stores the request body VERBATIM; it does not parse
+          # multipart/form-data. With --form the stored file would contain the
+          # MIME boundary + part headers + the SHA, the PUT would still return
+          # 201, and the plan job's GET would return that garbage -> `git
+          # cat-file -e` fails -> silent fallback to plain --changed (i.e. the
+          # drift this feature exists to prevent). Verified against the
+          # documented publish method:
+          #   curl --header "PRIVATE-TOKEN: <token>" --upload-file file.txt \
+          #     ".../packages/generic/<pkg>/<ver>/<file>"
           curl --silent --fail --request PUT \
             --header "PRIVATE-TOKEN: ${GITLAB_API_TOKEN}" \
-            --form "file=@/tmp/last-applied-sha.txt" \
+            --upload-file /tmp/last-applied-sha.txt \
             "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${last_applied_pkg}/latest/last-applied-sha.txt" \
             && echo "Last-applied ref recorded: ${CI_COMMIT_SHA}" \
             || echo "WARNING: could not record last-applied ref (non-fatal; plan jobs fall back to --changed)"
